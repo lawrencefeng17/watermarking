@@ -2,7 +2,9 @@ import pandas as pd
 import os
 
 plots_dir = '/home/lawrence/prc/plots'
-df_statistics = pd.read_csv('/home/lawrence/prc/token_statistics_merged.csv')
+if not os.path.exists(plots_dir):
+    os.makedirs(plots_dir)
+df_statistics = pd.read_csv("/home/lawrence/prc/src/statistics/llama-3.2-1B-instruct/updated_categories.csv")
 
 print(df_statistics.columns)
 summary = df_statistics['statistic'].describe()

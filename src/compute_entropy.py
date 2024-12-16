@@ -87,7 +87,7 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
     
     return df
 
-data_dir = '/raid/lawrence/compressed_data/'
+data_dir = '/raid/lawrence/compressed_data/init/'
 
 # Process the dataset and get the statistics DataFrame
-df_statistics = process_dataset(data_dir, output_csv='/home/lawrence/prc/dolly15k_token_entropy.csv')
+df_statistics = process_dataset(data_dir, output_csv='/home/lawrence/prc/src/statistics/llama-3.2-1B-instruct/entropy_statistics.csv')
