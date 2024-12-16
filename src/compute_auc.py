@@ -8,74 +8,100 @@ import zstandard as zstd
 from tqdm import tqdm
 import torch
 
-def assign_buckets(vocab_size, num_buckets, device, seed=None):
+def assign_buckets(vocab_size, num_buckets, seed=None):
     """
-    Assigns tokens to buckets randomly but evenly, returning a tensor on the specified device.
+    Assigns tokens to buckets randomly but evenly.
+
+    Args:
+        vocab_size (int): Number of tokens.
+        num_buckets (int): Number of buckets (must be a power of 2).
+        seed (int, optional): Random seed for reproducibility.
+
+    Returns:
+        np.ndarray: Array of bucket assignments for each token.
     """
     if seed is not None:
-        torch.manual_seed(seed)
-        
-    # Create assignments on CPU first
-    tokens = torch.randperm(vocab_size)
+        np.random.seed(seed)
+    tokens = np.arange(vocab_size)
+    np.random.shuffle(tokens)
     
     base = vocab_size // num_buckets
     remainder = vocab_size % num_buckets
     bucket_sizes = [base + 1 if i < remainder else base for i in range(num_buckets)]
     
-    bucket_assignments = torch.empty(vocab_size, dtype=torch.long)
+    bucket_assignments = np.empty(vocab_size, dtype=int)
     current = 0
     for bucket_id, size in enumerate(bucket_sizes):
         bucket_assignments[tokens[current:current+size]] = bucket_id
         current += size
     
-    return bucket_assignments.to(device)
+    return bucket_assignments
 
-def compute_statistic_batch(token_probs, bucket_assignments, num_buckets):
+def compute_statistic(token_probs, bucket_assignments, num_buckets):
     """
-    Computes statistics for a batch of token probability distributions using GPU operations.
-    
+    Computes the statistic for a single token probability distribution.
+
     Args:
-        token_probs (torch.Tensor): Batch of token probabilities (shape: [batch_size, vocab_size])
-        bucket_assignments (torch.Tensor): Bucket assignments tensor (shape: [vocab_size])
-        num_buckets (int): Number of buckets
-    
-    Returns:
-        torch.Tensor: Computed statistics for the batch
-    """
-    # Create a sparse matrix for bucket assignments
-    batch_size = token_probs.shape[0]
-    vocab_size = token_probs.shape[1]
-    
-    # Sum probabilities per bucket using sparse matrix multiplication
-    # Create indices for scatter operation
-    batch_indices = torch.arange(batch_size, device=token_probs.device).unsqueeze(1).expand(-1, vocab_size)
-    bucket_indices = bucket_assignments.unsqueeze(0).expand(batch_size, -1)
-    
-    # Compute bucket sums using scatter_add
-    w_i = torch.zeros(batch_size, num_buckets, device=token_probs.device)
-    w_i.scatter_add_(1, bucket_indices, token_probs)
-    
-    # Compute max(0, 1 - num_buckets * w_i)
-    max_vals = torch.clamp(1 - num_buckets * w_i, min=0)
-    
-    # Compute mean over buckets
-    return torch.mean(max_vals, dim=1)
+        token_probs (np.ndarray): Array of token probabilities (size: vocab_size).
+        bucket_assignments (np.ndarray): Array of bucket assignments (size: vocab_size).
+        num_buckets (int): Number of buckets.
 
-def process_dataset(data_dir, output_csv='token_statistics.csv', batch_size=32, device='cuda'):
+    Returns:
+        float: Computed statistic.
     """
-    Processes all compressed data files and computes statistics using GPU acceleration.
+    # Sum probabilities per bucket
+    w_i = np.bincount(bucket_assignments, weights=token_probs, minlength=num_buckets)
+    
+    max_vals = np.maximum(0, 1 / num_buckets - w_i)
+    
+    statistic = np.sum(max_vals)
+    
+    return statistic
+
+def load_compressed_data(file_path):
     """
+    Loads compressed data from a .zst file.
+
+    Args:
+        file_path (str): Path to the compressed file.
+
+    Returns:
+        dict: Decompressed data.
+    """
+    with open(file_path, 'rb') as f:
+        compressed_data = f.read()
+    decompressed_data = pickle.loads(zstd.decompress(compressed_data))
+    return decompressed_data
+
+def process_dataset(data_dir, output_csv='token_statistics.csv'):
+    """
+    Processes all compressed data files and computes statistics.
+
+    Args:
+        data_dir (str): Directory containing compressed data files.
+        output_csv (str): Path to save the output CSV.
+
+    Returns:
+        pd.DataFrame: DataFrame containing all computed statistics.
+    """
+    # Define bucket sizes (2^1 to 2^14)
     bucket_sizes = [2**i for i in range(1, 15)]
-    vocab_size = 128256
     
-    # Precompute bucket assignments for each bucket size on GPU
+    # Assuming vocab_size is 128k as per your description
+    vocab_size = 128256  # Adjust if different
+    
+    # Precompute bucket assignments for each bucket size
     print("Assigning tokens to buckets...")
-    bucket_assignments_dict = {
-        num_buckets: assign_buckets(vocab_size, num_buckets, device, seed=num_buckets)
-        for num_buckets in bucket_sizes
-    }
+    bucket_assignments_dict = {}
+    for num_buckets in bucket_sizes:
+        seed = num_buckets  # Different seed for each bucket size
+        bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
+        bucket_assignments_dict[num_buckets] = bucket_assignments
     
+    # Initialize list to store results
     results = []
+    
+    # List all compressed data files
     compressed_files = [f for f in os.listdir(data_dir) if f.endswith('.zst')]
     
     print("Processing files and computing statistics...")
@@ -85,58 +111,41 @@ def process_dataset(data_dir, output_csv='token_statistics.csv', batch_size=32, 
         
         prompt = data['prompt']
         category = data.get('category', 'Unknown')
-        token_probs = torch.tensor(data['probs'], device=device)
+        token_probs = torch.tensor(data['probs'])
         token_probs = token_probs.squeeze(1)
-        print(file_path, token_probs.shape)
         
-        # Process in batches
-        num_samples = token_probs.size(0)
-        for i in range(0, num_samples, batch_size):
-            batch_probs = token_probs[i:i+batch_size]
+        for i in range(token_probs.size(0)):
+            token_probs_np = token_probs[i].numpy()
             
             for num_buckets in bucket_sizes:
                 bucket_assignments = bucket_assignments_dict[num_buckets]
-                stats = compute_statistic_batch(batch_probs, bucket_assignments, num_buckets)
+                stat = compute_statistic(token_probs_np, bucket_assignments, num_buckets)
                 
-                # Move results to CPU for storage
-                stats_cpu = stats.cpu().numpy()
-                
-                for j, stat in enumerate(stats_cpu):
-                    results.append({
-                        'prompt': prompt,
-                        'category': category,
-                        'bucket_size': num_buckets,
-                        'statistic': stat
-                    })
+                results.append({
+                    'prompt': prompt,
+                    'category': category,
+                    'bucket_size': num_buckets,
+                    'statistic': stat
+                })
 
-        break
-    
+    # Convert results to DataFrame
     df = pd.DataFrame(results)
+    
+    # Save to CSV
     df.to_csv(output_csv, index=False)
     print(f"Statistics saved to {output_csv}")
     
     return df
 
-def load_compressed_data(file_path):
-    """Loads compressed data from a .zst file."""
-    with open(file_path, 'rb') as f:
-        compressed_data = f.read()
-    decompressed_data = pickle.loads(zstd.decompress(compressed_data))
-    return decompressed_data
+parser = argparse.ArgumentParser()
+parser.add_argument('--data-dir', type=str, required=True)
+args = parser.parse_args()
 
-# Example usage
-if __name__ == "__main__":
-    data_dir = '/raid/lawrence/compressed_data/'
-    plots_dir = '/home/lawrence/prc/plots/'
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    # Use the GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Process the dataset with GPU acceleration
-    df_statistics = process_dataset(
-        data_dir, 
-        output_csv='/home/lawrence/prc/token_statistics.csv',
-        batch_size=32,  # Adjust based on your GPU memory
-        device=device
-    )
+data_dir = args.data_dir
+name = data_dir.split('/')[-1]
+plots_dir = f'/home/lawrence/prc/plots/{name}'
+output_csv = f'/home/lawrence/prc/statistics/{name}/token_statistics.csv'
+os.makedirs(plots_dir, exist_ok=True)
+
+# Process the dataset and get the statistics DataFrame
+df_statistics = process_dataset(data_dir, output_csv=output_csv)

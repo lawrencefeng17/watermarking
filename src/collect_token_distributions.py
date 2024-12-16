@@ -8,12 +8,22 @@ from tqdm import tqdm
 import pandas as pd
 import argparse
 
-dataset = load_dataset("databricks/databricks-dolly-15k")
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', type=str, default='databricks/databricks-dolly-15k')
+parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-1B-Instruct')
+args = parser.parse_args()
+output_dir = f"/raid/lawrence/compressed_data/{args.dataset.replace('/', '_')}_{args.model.replace('/', '_')}"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
 
-config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+dataset = load_dataset(args.dataset)
+
+config = AutoConfig.from_pretrained(args.model)
 print(config)
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained(args.model)
+print("tokenizer loaded...")
+model = AutoModelForCausalLM.from_pretrained(args.model)
+print(args.model + " loaded...")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
@@ -25,19 +35,15 @@ def get_all_token_distributions(prompt, max_new_tokens=50):
         max_new_tokens=max_new_tokens,
         return_dict_in_generate=True,
         output_scores=True,
-        do_sample=False  # Change to True if sampling is desired
+        do_sample=False 
     )
     logits_list = outputs.scores
     probabilities_list = [torch.softmax(logit, dim=-1).cpu().numpy() for logit in logits_list]
     return probabilities_list
 
 def compress_and_store(idx, prompt, category, token_probs, output_dir='compressed_data'):
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
     stored_data = {
-        "prompt": prompt,
-        "category": category,
+        "idx": idx,
         "probs": [prob.tolist() for prob in token_probs]
     }
 
@@ -48,12 +54,6 @@ def compress_and_store(idx, prompt, category, token_probs, output_dir='compresse
 # Prepare metadata storage
 metadata = []
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-o', type=str, default='/raid/lawrence/compressed_data')
-args = parser.parse_args()
-output_dir = args.o
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
 
 # Iterate and collect data
 for idx, entry in enumerate(tqdm(dataset['train'])):
