@@ -2,10 +2,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import argparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser(description='Plot entropy statistics.')
+parser.add_argument('--csv', required=True)
+args = parser.parse_args()
 
 # Configuration
-input_csv = '/home/lawrence/prc/src/statistics/llama-3.2-1B-instruct/token_entropy.csv'  # Replace with your entropy CSV file path
-plots_dir = '/home/lawrence/prc/plots/'  # Replace with your desired output directory
+input_csv = args.csv
+
+src_dir = Path(__file__).resolve().parent
+plots_dir = src_dir / '../plots'
 
 # Create plots directory if it doesn't exist
 os.makedirs(plots_dir, exist_ok=True)

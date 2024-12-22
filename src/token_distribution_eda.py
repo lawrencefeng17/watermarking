@@ -1,10 +1,18 @@
 import pandas as pd
 import os
+import argparse
+from pathlib import Path
 
-plots_dir = '/home/lawrence/prc/plots'
+parser = argparse.ArgumentParser(description='Compute AUC for token distributions.')
+parser.add_argument('-f', required=True, description='input CSV')
+args = parser.parse_args()
+
+src_dir = Path(__file__).resolve().parent
+plots_dir = src_dir / '../plots'
+
 if not os.path.exists(plots_dir):
     os.makedirs(plots_dir)
-df_statistics = pd.read_csv("/home/lawrence/prc/src/statistics/llama-3.2-1B-instruct/updated_categories.csv")
+df_statistics = pd.read_csv(args.f)
 
 print(df_statistics.columns)
 summary = df_statistics['statistic'].describe()

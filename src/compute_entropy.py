@@ -7,6 +7,7 @@ import argparse
 import zstandard as zstd
 from tqdm import tqdm
 import torch
+from pathlib import Path
 
 from scipy.stats import entropy
 
@@ -51,6 +52,8 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
     Returns:
         pd.DataFrame: DataFrame containing all computed statistics.
     """
+    metadata = pd.read_csv(os.path.join(data_dir, 'metadata.csv'))
+
     # Initialize list to store results
     results = []
     
@@ -62,8 +65,9 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
         file_path = os.path.join(data_dir, file_name)
         data = load_compressed_data(file_path)
         
-        prompt = data['prompt']
-        category = data['category']
+        idx = data['idx']
+        prompt = metadata.loc[metadata['idx'] == idx, 'prompt'].values[0]
+        category = metadata.loc[metadata['idx'] == idx, 'category'].values[0]
         token_probs = torch.tensor(data['probs'])
         token_probs = token_probs.squeeze(1)
         
@@ -77,17 +81,26 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
                 'category': category,
                 'entropy': stat
             })
+        
+        # Convert results to DataFrame and append to CSV
+        df = pd.DataFrame(results)
+        df.to_csv(output_csv, mode='a', header=not os.path.exists(output_csv), index=False)
+        results.clear()  # Clear results after appending to CSV
     
-    # Convert results to DataFrame
-    df = pd.DataFrame(results)
-    
-    # Save to CSV
-    df.to_csv(output_csv, index=False)
     print(f"Statistics saved to {output_csv}")
     
-    return df
+    return pd.read_csv(output_csv)
 
-data_dir = '/raid/lawrence/compressed_data/init/'
 
-# Process the dataset and get the statistics DataFrame
-df_statistics = process_dataset(data_dir, output_csv='/home/lawrence/prc/src/statistics/llama-3.2-1B-instruct/entropy_statistics.csv')
+parser = argparse.ArgumentParser(description='Compute entropy statistics for a dataset.')
+parser.add_argument('--data-dir', required=True, type=str, help='Path to the directory containing compressed data files.')
+args = parser.parse_args()
+
+data_dir = args.data_dir
+output_dir = data_dir.split('_')[-1]
+src_dir = Path(__file__).resolve().parent
+output_dir = src_dir / '../statistics' / output_dir
+output_csv = output_dir / 'token_statistics.csv'
+
+#  Process the dataset and get the statistics DataFrame
+df_statistics = process_dataset(data_dir, output_csv=output_csv)

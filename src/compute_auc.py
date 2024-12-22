@@ -7,6 +7,7 @@ import argparse
 import zstandard as zstd
 from tqdm import tqdm
 import torch
+from pathlib import Path
 
 def assign_buckets(vocab_size, num_buckets, seed=None):
     """
@@ -88,7 +89,7 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
     bucket_sizes = [2**i for i in range(1, 15)]
     
     # Assuming vocab_size is 128k as per your description
-    vocab_size = 128256  # Adjust if different
+    vocab_size = torch.tensor(load_compressed_data(os.path.join(data_dir, 'compressed_data_0.zst'))['probs']).size(2)
     
     # Precompute bucket assignments for each bucket size
     print("Assigning tokens to buckets...")
@@ -103,14 +104,16 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
     
     # List all compressed data files
     compressed_files = [f for f in os.listdir(data_dir) if f.endswith('.zst')]
+    metadata = pd.read_csv(os.path.join(data_dir, 'metadata.csv'))
     
     print("Processing files and computing statistics...")
     for file_name in tqdm(compressed_files):
         file_path = os.path.join(data_dir, file_name)
         data = load_compressed_data(file_path)
         
-        prompt = data['prompt']
-        category = data.get('category', 'Unknown')
+        idx = data['idx']
+        prompt = metadata.loc[metadata['idx'] == idx, 'prompt'].values[0]
+        category = metadata.loc[metadata['idx'] == idx, 'category'].values[0]
         token_probs = torch.tensor(data['probs'])
         token_probs = token_probs.squeeze(1)
         
@@ -143,8 +146,10 @@ args = parser.parse_args()
 
 data_dir = args.data_dir
 name = data_dir.split('/')[-1]
-plots_dir = f'/home/lawrence/prc/plots/{name}'
-output_csv = f'/home/lawrence/prc/statistics/{name}/token_statistics.csv'
+src_dir = Path(__file__).resolve().parent
+plots_dir = src_dir / '../plots'
+output_csv = src_dir / f'statistics/{name}/token_statistics.csv'
+
 os.makedirs(plots_dir, exist_ok=True)
 
 # Process the dataset and get the statistics DataFrame
