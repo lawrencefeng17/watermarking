@@ -4,18 +4,17 @@ import argparse
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description='Compute AUC for token distributions.')
-parser.add_argument('-f', required=True, description='input CSV')
+parser.add_argument('-f', required=True)
 args = parser.parse_args()
 
-src_dir = Path(__file__).resolve().parent
-plots_dir = src_dir / '../plots'
+dir = Path(args.f).parent
+plots_dir = dir / 'plots'
 
-if not os.path.exists(plots_dir):
-    os.makedirs(plots_dir)
+os.makedirs(plots_dir, exist_ok=True)
 df_statistics = pd.read_csv(args.f)
 
 print(df_statistics.columns)
-summary = df_statistics['statistic'].describe()
+summary = df_statistics['auc'].describe()
 print(summary)
 
 import matplotlib.pyplot as plt

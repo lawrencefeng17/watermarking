@@ -97,10 +97,15 @@ parser.add_argument('--data-dir', required=True, type=str, help='Path to the dir
 args = parser.parse_args()
 
 data_dir = args.data_dir
-output_dir = data_dir.split('_')[-1]
+data_dir = Path(data_dir)
+name = data_dir.stem
 src_dir = Path(__file__).resolve().parent
-output_dir = src_dir / '../statistics' / output_dir
-output_csv = output_dir / 'token_statistics.csv'
+plots_dir = src_dir / '../plots'
+output_csv = src_dir / 'statistics' / name / 'token_entropy.csv'
+
+os.makedirs(plots_dir, exist_ok=True)
 
 #  Process the dataset and get the statistics DataFrame
+print("Data directory: " + str(data_dir))
+print("Output CSV: " + str(output_csv))
 df_statistics = process_dataset(data_dir, output_csv=output_csv)

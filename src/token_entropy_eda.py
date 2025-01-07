@@ -6,20 +6,21 @@ import argparse
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description='Plot entropy statistics.')
-parser.add_argument('--csv', required=True)
+parser.add_argument('-f', required=True)
 args = parser.parse_args()
 
-# Configuration
-input_csv = args.csv
-
-src_dir = Path(__file__).resolve().parent
-plots_dir = src_dir / '../plots'
+dir = Path(args.f).parent
+plots_dir = dir / 'plots'
 
 # Create plots directory if it doesn't exist
 os.makedirs(plots_dir, exist_ok=True)
 
 # Load the entropy CSV
-df = pd.read_csv(input_csv)
+df = pd.read_csv(args.f)
+
+print(df.columns)
+summary = df['entropy'].describe()
+print(summary)
 
 # Ensure the DataFrame has the required columns
 if 'entropy' not in df.columns or 'category' not in df.columns:

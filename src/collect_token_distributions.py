@@ -16,6 +16,9 @@ import gc
 from torch.cuda import empty_cache
 from contextlib import contextmanager
 
+# "databricks/databricks-dolly-15k"
+# "meta-llama/Llama-3.2-1B-Instruct"
+# "Qwen/Qwen2.5-1.5B-Instruct"
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, required=True)
 parser.add_argument('--model', type=str, required=True)
@@ -92,7 +95,6 @@ def get_batch_token_distributions(prompts: List[str], model, tokenizer, max_new_
                 sequence_probs = [torch.softmax(score, dim=-1).cpu().numpy() for score in sequence_scores]
                 batch_probabilities.append(sequence_probs)
             
-            breakpoint()
             return batch_probabilities
             
     except Exception as e:

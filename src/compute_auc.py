@@ -89,7 +89,7 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
     bucket_sizes = [2**i for i in range(1, 15)]
     
     # Assuming vocab_size is 128k as per your description
-    vocab_size = torch.tensor(load_compressed_data(os.path.join(data_dir, 'compressed_data_0.zst'))['probs']).size(2)
+    vocab_size = torch.tensor(load_compressed_data(os.path.join(data_dir, 'compressed_data_0.zst'))['probs']).size(-1)
     
     # Precompute bucket assignments for each bucket size
     print("Assigning tokens to buckets...")
@@ -107,7 +107,7 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
     metadata = pd.read_csv(os.path.join(data_dir, 'metadata.csv'))
     
     print("Processing files and computing statistics...")
-    for file_name in tqdm(compressed_files):
+    for idx, file_name in enumerate(tqdm(compressed_files)):
         file_path = os.path.join(data_dir, file_name)
         data = load_compressed_data(file_path)
         
@@ -131,26 +131,33 @@ def process_dataset(data_dir, output_csv='token_statistics.csv'):
                     'statistic': stat
                 })
 
-    # Convert results to DataFrame
-    df = pd.DataFrame(results)
-    
-    # Save to CSV
-    df.to_csv(output_csv, index=False)
-    print(f"Statistics saved to {output_csv}")
-    
-    return df
+        if idx % 1000 == 0:
+            # Convert results to DataFrame and append to CSV
+            df = pd.DataFrame(results)
+            df.to_csv(output_csv, index=False, mode='a', header=False)
+            results = []
+
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(output_csv, index=False, mode='a', header=False)
+        
+    print("Processing complete!")
+    return pd.read_csv(output_csv)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data-dir', type=str, required=True)
 args = parser.parse_args()
 
 data_dir = args.data_dir
-name = data_dir.split('/')[-1]
+data_dir = Path(data_dir)
+name = data_dir.stem
 src_dir = Path(__file__).resolve().parent
 plots_dir = src_dir / '../plots'
-output_csv = src_dir / f'statistics/{name}/token_statistics.csv'
+output_csv = src_dir / 'statistics' / name / 'token_auc.csv'
 
 os.makedirs(plots_dir, exist_ok=True)
 
+print("Data directory: " + str(data_dir))
+print("Output CSV: " + str(output_csv))
 # Process the dataset and get the statistics DataFrame
 df_statistics = process_dataset(data_dir, output_csv=output_csv)

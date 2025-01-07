@@ -41,7 +41,7 @@ import argparse
 if __name__ == "__main__":
     # Parse arguments
     parser = argparse.ArgumentParser(description="Update categories in token statistics CSV")
-    parser.add_argument("--input", type=str, default='/home/lawrence/prc/src/statistics/llama-3.2-1B-instruct/token_statistics.csv')
+    parser.add_argument("--input", type=str)
     args = parser.parse_args()
     
     updated_df = update_categories(args.input)
