@@ -13,6 +13,21 @@ from contextlib import contextmanager
 from tqdm import tqdm
 from datetime import datetime
 
+###############################################################################
+#                           ARG PARSING & SETUP                               #
+###############################################################################
+# "databricks/databricks-dolly-15k"
+# "meta-llama/Llama-3.2-1B-Instruct"
+# "Qwen/Qwen2.5-1.5B-Instruct"
+parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
+parser.add_argument('--dataset', type=str, required=True, help='Name or path of the dataset.')
+parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
+parser.add_argument('--batch_size', type=int, default=128, help='Batch size for processing prompts.')
+parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
+parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
+parser.add_argument('--num_workers', type=int, default=64, help='Number of parallel workers for analysis.')
+args = parser.parse_args()
+
 def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quantize):
     """
     Create a structured output directory for storing experiment results.
@@ -44,21 +59,6 @@ def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quan
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return output_dir
-
-###############################################################################
-#                           ARG PARSING & SETUP                               #
-###############################################################################
-# "databricks/databricks-dolly-15k"
-# "meta-llama/Llama-3.2-1B-Instruct"
-# "Qwen/Qwen2.5-1.5B-Instruct"
-parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
-parser.add_argument('--dataset', type=str, required=True, help='Name or path of the dataset.')
-parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
-parser.add_argument('--batch_size', type=int, default=128, help='Batch size for processing prompts.')
-parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
-parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
-parser.add_argument('--num_workers', type=int, default=32, help='Number of parallel workers for analysis.')
-args = parser.parse_args()
 
 # Output directory for logs, checkpoints, and results
 src_dir = Path(__file__).resolve().parent
@@ -447,7 +447,7 @@ def main():
             # Save updated metadata after final batch
             save_metadata(metadata)
     
-    print("All done")
+    print("Completed!")
     print(f"Saved to {output_dir}")
 
 if __name__ == "__main__":
