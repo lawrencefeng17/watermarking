@@ -16,8 +16,8 @@ from datetime import datetime
 ###############################################################################
 #                           ARG PARSING & SETUP                               #
 ###############################################################################
-# "databricks/databricks-dolly-15k"
-# "meta-llama/Llama-3.2-1B-Instruct"
+# --datasets "databricks/databricks-dolly-15k"
+# --model "meta-llama/Llama-3.2-1B-Instruct"
 # "Qwen/Qwen2.5-1.5B-Instruct"
 parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
 parser.add_argument('--dataset', type=str, required=True, help='Name or path of the dataset.')
