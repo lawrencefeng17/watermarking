@@ -12,7 +12,7 @@ args = parser.parse_args()
 
 # ------------------------------ SETUP DIRECTORIES -----------------------------
 metadata_path = Path(args.file)
-output_dir = metadata_path / 'plots'
+output_dir = metadata_path.parent / 'plots'
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # ------------------------------ LOAD DATA --------------------------------------

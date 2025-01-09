@@ -25,7 +25,7 @@ parser.add_argument('--model', type=str, required=True, help='Name or path of th
 parser.add_argument('--batch_size', type=int, default=128, help='Batch size for processing prompts.')
 parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
 parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
-parser.add_argument('--num_workers', type=int, default=64, help='Number of parallel workers for analysis.')
+parser.add_argument('--num_workers', type=int, default=20, help='Number of parallel workers for analysis.')
 args = parser.parse_args()
 
 def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quantize):
@@ -204,8 +204,13 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
                 return_dict_in_generate=True,
                 output_scores=True,
                 do_sample=False,
-                pad_token_id=tokenizer.pad_token_id
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
             )
+
+            # generated_texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs.sequences]
+            # for text in generated_texts:
+            #     print(text)
             
             # outputs.scores is a list of length=#generated_tokens
             # Each element is shape=[batch_size, vocab_size]
@@ -291,10 +296,12 @@ def main():
     print("Loading model and tokenizer...")
     config = AutoConfig.from_pretrained(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    
+    tokenizer.padding_side = 'left'
+
     # Add padding token if it doesn't exist
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
 
     vocab_size = config.vocab_size
     
