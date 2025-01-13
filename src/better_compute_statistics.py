@@ -1,5 +1,7 @@
+# An implementation using BetterTransformer for improved performance
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import BetterTransformer
 from datasets import load_dataset
 import numpy as np
 import pandas as pd
@@ -16,7 +18,7 @@ from datetime import datetime
 ###############################################################################
 #                           ARG PARSING & SETUP                               #
 ###############################################################################
-# --dataset "databricks/databricks-dolly-15k"
+# --datasets "databricks/databricks-dolly-15k"
 # --model "meta-llama/Llama-3.2-1B-Instruct"
 # "Qwen/Qwen2.5-1.5B-Instruct"
 parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
@@ -62,8 +64,7 @@ def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quan
 
 # Output directory for logs, checkpoints, and results
 src_dir = Path(__file__).resolve().parent
-root_dir = src_dir.parent
-output_dir = create_output_dir(root_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
+output_dir = create_output_dir(src_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
 output_dir.mkdir(parents=True, exist_ok=True)
 
 checkpoint_file = output_dir / "checkpoint.json"
@@ -297,8 +298,6 @@ def main():
     print("Loading model and tokenizer...")
     config = AutoConfig.from_pretrained(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    # Check for warnings
-    # Padding is on left for decoder-only models (e.g. Llama)
     tokenizer.padding_side = 'left'
 
     # Add padding token if it doesn't exist
@@ -321,6 +320,10 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device)
     
+    # Transform the model using BetterTransformer
+    print("Optimizing model with BetterTransformer...")
+    model = BetterTransformer.transform(model)
+
     print(f"Model loaded with {'8-bit quantization' if args.quantize else 'full precision'}")
     
     #---------------------------------------------------------------------------

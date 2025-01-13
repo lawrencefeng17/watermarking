@@ -1,6 +1,5 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from datasets import load_dataset
 import pandas as pd
 import numpy as np
 import argparse
@@ -11,38 +10,43 @@ from torch.cuda import empty_cache
 from contextlib import contextmanager
 from typing import List, Dict
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
+import datetime
 
-from scipy.stats import entropy
+from compute_statistics import assign_buckets 
+from compute_statistics import analyze_token_distributions
 
-from compute_statistics_with_entropy import compute_entropy, assign_buckets, compute_statistic
+# --model "meta-llama/Llama-3.2-1B-Instruct"
 
-class TokenDistributionAnalyzer:
-    def __init__(self, model_name: str, device: str = "auto"):
-        self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map=device
-        )
-        self.model.eval()
-        
-        # Check if the model has a chat template
-        self.has_chat_template = hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None
+parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
+parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
+parser.add_argument('--quantize', action='store_true', help='Use 8-bit quantization for the model.', default=False)
 
-    @contextmanager
-    def cuda_memory_manager():
-        """Context manager to handle CUDA memory cleanup"""
-        try:
-            yield
-        finally:
-            gc.collect()
-            empty_cache()
+args = parser.parse_args()
 
-    def format_chat(self, prompt: str, system_prompt: str = "") -> str:
+prompts = [
+        "What is the capital of France?",
+        "How do you make a cake?",
+        "Tell me a joke.",
+        "What is the meaning of life?",
+        "Explain quantum physics in simple terms.",
+        "Tell me a creative love story between a robot and a human.",
+    ]
+    
+system_prompts = [
+        "Be creative and helpful.",
+        "Be concise and informative.",
+        "Be detailed and thorough.",
+        "Use flashy language and be engaging.",
+        "Use colorful language and be engaging.",
+    ] 
+
+temperatures = [0.5, 0.7, 1.0, 1.2, 1.4]
+
+max_output_tokens = [50, 100, 250, 400]
+
+def format_chat(tokenizer, prompt: str, system_prompt: str = "", has_chat_template=False) -> str:
         """Format the conversation using the model's chat template or a default format."""
-        if not system_prompt and not self.has_chat_template:
+        if not system_prompt and not has_chat_template:
             return prompt
             
         messages = []
@@ -50,9 +54,9 @@ class TokenDistributionAnalyzer:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         
-        if self.has_chat_template:
+        if has_chat_template:
             # Use the model's built-in chat template
-            return self.tokenizer.apply_chat_template(
+            return tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True
@@ -67,147 +71,125 @@ class TokenDistributionAnalyzer:
                     formatted += f"<|user|>\n{msg['content']}\n"
             formatted += "<|assistant|>\n"
             return formatted
-        
-    def get_token_distributions(
-        self,
-        prompt: str,
-        system_prompt: str = "",
-        num_tokens: int = 50,
-        temperature: float = 1.0,
-        top_p: float = 0.9
-    ) -> List[torch.Tensor]:
-        """Generate token distributions for each position."""
-        formatted_prompt = self.format_chat(prompt, system_prompt)
-        input_ids = self.tokenizer.encode(formatted_prompt, return_tensors="pt").to(self.device)
-        
-        # Print the actual tokens for debugging
-        print("Formatted prompt tokens:")
-        print(self.tokenizer.convert_ids_to_tokens(input_ids[0]))
-        
-        distributions = []
-        
-        with self._manage_memory():
-            with torch.no_grad():
-                for _ in range(num_tokens):
-                    outputs = self.model(input_ids)
-                    logits = outputs.logits[:, -1, :]
-                    
-                    # Apply temperature and top-p sampling
-                    logits = logits / temperature
-                    probs = torch.softmax(logits, dim=-1)
-                    
-                    if top_p < 1.0:
-                        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-                        mask = cumsum_probs <= top_p
-                        mask[..., 1:] = mask[..., :-1].clone()
-                        mask[..., 0] = True
-                        probs[sorted_indices[~mask]] = 0.0
-                        probs = probs / probs.sum(dim=-1, keepdim=True)
-                    
-                    distributions.append(probs.cpu())
-                    
-                    # Sample next token
-                    next_token = torch.multinomial(probs, 1)
-                    input_ids = torch.cat([input_ids, next_token], dim=-1)
-        
-        return distributions
 
-    def analyze_distributions(
-        self,
-        distributions: List[torch.Tensor],
-        bucket_boundaries: List[float] = None
-    ) -> Dict:
-        """Compute entropy and statistics for token distributions."""
-        if bucket_boundaries is None:
-            bucket_boundaries = [0.0, 0.001, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
-        
-        entropies = []
-        statistics = []
-        
-        for dist in distributions:
-            dist_np = dist.numpy().flatten()
-            
-            # Compute entropy
-            pos_entropy = compute_entropy(dist_np)
-            entropies.append(pos_entropy)
-            
-            # Compute probability distribution statistics
-            buckets = assign_buckets(dist_np, bucket_boundaries)
-            pos_stats = compute_statistic(buckets)
-            statistics.append(pos_stats)
-        
-        return {
-            "entropies": entropies,
-            "statistics": statistics,
-            "mean_entropy": np.mean(entropies),
-            "std_entropy": np.std(entropies),
-            "mean_statistic": np.mean(statistics),
-            "std_statistic": np.std(statistics)
-        }
+def main():
+    print("Loading model and tokenizer...")
+    config = AutoConfig.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.padding_side = 'left'
 
-    def run_analysis(
-        self,
-        prompts: List[str],
-        system_prompts: List[str] = None,
-        num_tokens: int = 50,
-        temperature: float = 1.0,
-        top_p: float = 0.9,
-        n_threads: int = 4
-    ) -> pd.DataFrame:
-        """Run analysis on multiple prompts and system prompts."""
-        if system_prompts is None:
-            system_prompts = [""] * len(prompts)
-        
-        results = []
-        
-        def process_prompt(args):
-            prompt, system_prompt = args
-            distributions = self.get_token_distributions(
-                prompt, system_prompt, num_tokens, temperature, top_p
-            )
-            analysis = self.analyze_distributions(distributions)
-            return {
-                "prompt": prompt,
-                "system_prompt": system_prompt,
-                **analysis
-            }
-        
-        with ThreadPoolExecutor(max_workers=n_threads) as executor:
-            for result in tqdm(
-                executor.map(process_prompt, zip(prompts, system_prompts)),
-                total=len(prompts)
-            ):
-                results.append(result)
-        
-        return pd.DataFrame(results)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-# Example usage:
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--prompts-file", type=Path, required=True)
-    parser.add_argument("--output-file", type=Path, required=True)
-    parser.add_argument("--num-tokens", type=int, default=50)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--n-threads", type=int, default=4)
-    args = parser.parse_args()
-
-    # Load prompts and system prompts from JSON file
-    with open(args.prompts_file) as f:
-        data = json.load(f)
-        prompts = data["prompts"]
-        system_prompts = data.get("system_prompts")
-
-    analyzer = TokenDistributionAnalyzer(args.model)
-    results_df = analyzer.run_analysis(
-        prompts=prompts,
-        system_prompts=system_prompts,
-        num_tokens=args.num_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        n_threads=args.n_threads
-    )
+    vocab_size = config.vocab_size
     
-    results_df.to_csv(args.output_file, index=False)
+    if args.quantize:
+        print("Loading quantized model...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            load_in_8bit=True,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+    
+    print(f"Model loaded with {'8-bit quantization' if args.quantize else 'full precision'}")
+
+    has_chat_template = hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None
+    
+    bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
+    bucket_assignments_dict = {}
+    print("Precomputing bucket assignments...")
+    for num_buckets in bucket_sizes:
+        seed = num_buckets
+        bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
+        bucket_assignments_dict[num_buckets] = bucket_assignments
+
+    results = []
+    
+    for prompt in tqdm(prompts, desc="Processing prompts"):
+        for system_prompt in system_prompts:
+            for temperature in temperatures:
+                for max_output_token in max_output_tokens:
+                    try:
+                        # Format the conversation
+                        formatted_prompt = format_chat(
+                            tokenizer,
+                            prompt,
+                            system_prompt,
+                            has_chat_template
+                        )
+                        
+                        # Tokenize the input
+                        inputs = tokenizer(
+                            formatted_prompt,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True
+                        ).to(model.device)
+                        
+                        # Generate with specified parameters
+                        with torch.no_grad():
+                            outputs = model.generate(
+                                **inputs,
+                                max_new_tokens=max_output_token,
+                                temperature=temperature,
+                                return_dict_in_generate=True,
+                                output_scores=True,
+                                do_sample=True,
+                                pad_token_id=tokenizer.pad_token_id,
+                                eos_token_id=tokenizer.eos_token_id
+                            )
+                        
+                        # Process token distributions
+                        token_distributions = []
+                        for scores in outputs.scores:
+                            probs = torch.softmax(scores[0], dim=-1).cpu().numpy()
+                            token_distributions.append(probs)
+                        
+                        # Analyze distributions for each token
+                        token_stats = analyze_token_distributions(
+                            token_distributions,
+                            bucket_assignments_dict
+                        )
+                        
+                        # Record results
+                        for token_stat in token_stats:
+                            result = {
+                                "prompt": prompt,
+                                "system_prompt": system_prompt,
+                                "temperature": temperature,
+                                "max_output_tokens": max_output_token,
+                                "token_index": token_stat["token_index"],
+                                "entropy": token_stat["entropy"]
+                            }
+                            # Add AUC values for each bucket size
+                            for k, v in token_stat.items():
+                                if k.startswith("auc_"):
+                                    result[k] = v
+                            results.append(result)
+                        
+                        # Clean up CUDA memory
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                    except Exception as e:
+                        print(f"Error processing prompt with parameters:")
+                        print(f"  Prompt: {prompt[:50]}...")
+                        print(f"  System Prompt: {system_prompt[:50]}...")
+                        print(f"  Temperature: {temperature}")
+                        print(f"  Max Tokens: {max_output_token}")
+                        print(f"Error: {str(e)}")
+                        continue
+
+    # Convert results to DataFrame and save
+    df_results = pd.DataFrame(results)
+    output_path = f"token_distribution_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    df_results.to_csv(output_path, index=False)
+    print(f"Analysis complete. Results saved to {output_path}")
+
+if __name__ == "__main__":
+    main() 
