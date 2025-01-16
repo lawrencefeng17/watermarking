@@ -18,7 +18,5 @@ python token_eda -f /home/lawrence/prc/src/statistics/databricks_databricks-doll
 
 * There is an archive folder of old code
 * Up to date code is in the src folder
-* For some reason I have chosen to put the plots in /src/statistics/
-    * At some point I will move things around
 
 

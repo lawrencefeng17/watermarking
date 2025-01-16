@@ -19,14 +19,6 @@ from datetime import datetime
 # --dataset "databricks/databricks-dolly-15k"
 # --model "meta-llama/Llama-3.2-1B-Instruct"
 # "Qwen/Qwen2.5-1.5B-Instruct"
-parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
-parser.add_argument('--dataset', type=str, required=True, help='Name or path of the dataset.')
-parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
-parser.add_argument('--batch_size', type=int, default=128, help='Batch size for processing prompts.')
-parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
-parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
-parser.add_argument('--num_workers', type=int, default=20, help='Number of parallel workers for analysis.')
-args = parser.parse_args()
 
 def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quantize):
     """
@@ -59,23 +51,6 @@ def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quan
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return output_dir
-
-# Output directory for logs, checkpoints, and results
-src_dir = Path(__file__).resolve().parent
-root_dir = src_dir.parent
-output_dir = create_output_dir(root_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
-output_dir.mkdir(parents=True, exist_ok=True)
-
-checkpoint_file = output_dir / "checkpoint.json"
-metadata_file = output_dir / "metadata.csv"
-
-print(f"Dataset: {args.dataset}")
-print(f"Model: {args.model}")
-print(f"Batch Size: {args.batch_size}")
-print(f"Max New Tokens: {args.max_new_tokens}")
-print(f"Quantization: {'Enabled' if args.quantize else 'Disabled'}")
-print(f"Parallel Workers: {args.num_workers}")
-print(f"Output Directory: {output_dir}")
 
 ###############################################################################
 #                        BUCKET ASSIGNMENT UTILS                              #
@@ -126,42 +101,56 @@ def compute_auc(token_probs, bucket_assignments, num_buckets):
     max_vals = np.maximum(0, 1/num_buckets - w_i)
     return np.sum(max_vals)
 
+# def compute_entropy(token_probs):
+#     """
+#     Computes entropy (base-2) for a single token's probability distribution.
+
+#     Args:
+#         token_probs (np.ndarray): Array of token probabilities (size: vocab_size).
+
+#     Returns:
+#         float: Entropy value.
+#     """
+#     # Avoid log(0) by adding a small epsilon
+#     token_probs = np.where(token_probs > 0, token_probs, 1e-12)
+#     return -np.sum(token_probs * np.log2(token_probs))
+
+from scipy.stats import entropy
+
 def compute_entropy(token_probs):
     """
-    Computes entropy (base-2) for a single token's probability distribution.
-
+    Computes entropy (base-2) using scipy.
+    
     Args:
         token_probs (np.ndarray): Array of token probabilities (size: vocab_size).
-
+        
     Returns:
         float: Entropy value.
     """
-    # Avoid log(0) by adding a small epsilon
-    token_probs = np.where(token_probs > 0, token_probs, 1e-12)
-    return -np.sum(token_probs * np.log2(token_probs))
+    return entropy(token_probs, base=2)
 
 ###############################################################################
 #                          CHECKPOINT & METADATA                              #
 ###############################################################################
-def load_checkpoint():
+def load_checkpoint(checkpoint_file):
     """Load the last processed index from the checkpoint file."""
     if checkpoint_file.exists():
         with open(checkpoint_file, 'r') as f:
             return json.load(f)['last_processed_idx']
     return -1
 
-def save_checkpoint(idx):
+def save_checkpoint(checkpoint_file, idx):
     """Save the last processed index into the checkpoint file."""
     with open(checkpoint_file, 'w') as f:
         json.dump({'last_processed_idx': idx}, f)
 
-def load_existing_metadata():
+def load_existing_metadata(metadata_file):
     """Load metadata CSV if it exists."""
     if metadata_file.exists():
         return pd.read_csv(metadata_file).to_dict('records')
     return []
 
-def save_metadata(metadata):
+def save_metadata(metadata_file, metadata):
     """Save the metadata as a CSV."""
     df_metadata = pd.DataFrame(metadata)
     df_metadata.to_csv(metadata_file, index=False)
@@ -204,6 +193,7 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
                 max_new_tokens=max_new_tokens,
                 return_dict_in_generate=True,
                 output_scores=True,
+                output_logits=True,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
@@ -218,7 +208,7 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
             # We'll transpose so we get per-sequence distributions:
             #  batch_distributions[seq_idx] = [ (#generated_tokens, vocab_size) ]
             batch_distributions = []
-            for seq_scores in zip(*outputs.scores):
+            for seq_scores in zip(*outputs.logits):
                 # seq_scores is a tuple of length=#generated_tokens, each element shape=(vocab_size,)
                 distributions = []
                 for score in seq_scores:
@@ -286,6 +276,32 @@ def analyze_worker(item, bucket_assignments_dict):
 #                                  MAIN                                       #
 ###############################################################################
 def main():
+    parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
+    parser.add_argument('--dataset', type=str, required=True, help='Name or path of the dataset.')
+    parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size for processing prompts.')
+    parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
+    parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
+    parser.add_argument('--num_workers', type=int, default=20, help='Number of parallel workers for analysis.')
+    args = parser.parse_args()
+
+    # Output directory for logs, checkpoints, and results
+    src_dir = Path(__file__).resolve().parent
+    root_dir = src_dir.parent
+    output_dir = create_output_dir(root_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_file = output_dir / "checkpoint.json"
+    metadata_file = output_dir / "metadata.csv"
+
+    print(f"Dataset: {args.dataset}")
+    print(f"Model: {args.model}")
+    print(f"Batch Size: {args.batch_size}")
+    print(f"Max New Tokens: {args.max_new_tokens}")
+    print(f"Quantization: {'Enabled' if args.quantize else 'Disabled'}")
+    print(f"Parallel Workers: {args.num_workers}")
+    print(f"Output Directory: {output_dir}")
+
     #---------------------------------------------------------------------------
     # 1) Load dataset
     #---------------------------------------------------------------------------
@@ -337,8 +353,8 @@ def main():
     #---------------------------------------------------------------------------
     # 4) Load progress (checkpoint) and existing metadata
     #---------------------------------------------------------------------------
-    last_processed_idx = load_checkpoint()
-    metadata = load_existing_metadata()
+    last_processed_idx = load_checkpoint(checkpoint_file)
+    metadata = load_existing_metadata(metadata_file)
     print(f"Resuming from index {last_processed_idx + 1}")
     
     #---------------------------------------------------------------------------
@@ -403,14 +419,14 @@ def main():
                     # Update checkpoint: the highest index that we have processed
                     if res_idx > last_processed_idx:
                         last_processed_idx = res_idx
-                        save_checkpoint(last_processed_idx)
+                        save_checkpoint(checkpoint_file, last_processed_idx)
                 
                 # Remove completed futures from the dict
                 for fut in done_futures:
                     del future_to_idx[fut]
                 
                 # Save updated metadata after each batch
-                save_metadata(metadata)
+                save_metadata(metadata_file, metadata)
                 
                 # Clear the batch
                 batch_prompts = []
@@ -452,7 +468,7 @@ def main():
                 # Update checkpoint
                 if res_idx > last_processed_idx:
                     last_processed_idx = res_idx
-                    save_checkpoint(last_processed_idx)
+                    save_checkpoint(checkpoint_file, last_processed_idx)
             
             # Save updated metadata after final batch
             save_metadata(metadata)

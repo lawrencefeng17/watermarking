@@ -85,6 +85,7 @@ avg_auc_cat = df_auc_long.groupby(['bucket_size', 'category'])['auc'].mean().res
 plt.figure(figsize=(14, 10))
 sns.lineplot(x='bucket_size', y='auc', hue='category', data=avg_auc_cat, marker='o')
 plt.xscale('log', base=2)
+plt.ylim(0.0, 1.0)
 plt.xlabel('Number of Buckets (Log Scale)')
 plt.ylabel('Average AUC Value')
 plt.title('Average AUC Across Bucket Sizes by Category')
@@ -162,24 +163,22 @@ plt.figure(figsize=(14, 8))
 sns.lineplot(x='token_index', y='entropy', data=avg_entropy_token, marker='o')
 plt.xlabel('Token Index')
 plt.ylabel('Average Entropy')
+plt.ylim(0.0, 5.0)
 plt.title('Average Entropy Across Token Indices')
 plt.tight_layout()
 plt.savefig(output_dir / 'avg_entropy_vs_token_index.png')
 plt.close()
 
 # -------------------- 2. Average AUC vs. Token Index ----------------------------
-# For AUC, select specific bucket sizes to plot
-selected_bucket_sizes_auc = [2, 8, 32, 128, 512, 2048, 8192]
-
-df_auc_long_selected = df_auc_long[df_auc_long['bucket_size'].isin(selected_bucket_sizes_auc)]
-
 # Compute average AUC per token index and bucket size
-avg_auc_token = df_auc_long_selected.groupby(['token_index', 'bucket_size'])['auc'].mean().reset_index()
+avg_auc_token = df_auc_long.groupby(['token_index', 'bucket_size'])['auc'].mean().reset_index()
+avg_auc_token['bucket_size'] = avg_auc_token['bucket_size'].astype('category')
 
 plt.figure(figsize=(14, 10))
 sns.lineplot(x='token_index', y='auc', hue='bucket_size', data=avg_auc_token, marker='o')
 plt.xlabel('Token Index')
 plt.ylabel('Average AUC')
+plt.ylim(0.0, 1.0)
 plt.title('Average AUC Across Token Indices for Selected Bucket Sizes')
 plt.legend(title='Bucket Size', bbox_to_anchor=(1.05, 1), loc='upper left')
 plt.tight_layout()
@@ -191,6 +190,7 @@ plt.figure(figsize=(14, 10))
 sns.boxplot(x='token_index', y='entropy', data=df_statistics)
 plt.xlabel('Token Index')
 plt.ylabel('Entropy Value')
+plt.ylim(0.0, 5.0)
 plt.title('Entropy Distribution Across Token Indices')
 plt.yscale('linear')  # You can change to 'log' if entropy values vary widely
 plt.tight_layout()
@@ -199,12 +199,13 @@ plt.close()
 
 # -------------------- 4. AUC Distribution by Token Index ------------------------
 # Similar to entropy, plot AUC distributions for selected bucket sizes
-df_auc_selected_token = df_auc_long_selected.copy()
+df_auc_selected_token = df_auc_long.copy()
 
 plt.figure(figsize=(14, 10))
 sns.boxplot(x='token_index', y='auc', hue='bucket_size', data=df_auc_selected_token)
 plt.xlabel('Token Index')
 plt.ylabel('AUC Value')
+plt.ylim(0.0, 1.0)
 plt.title('AUC Distribution Across Token Indices for Selected Bucket Sizes')
 plt.legend(title='Bucket Size', bbox_to_anchor=(1.05, 1), loc='upper left')
 plt.tight_layout()

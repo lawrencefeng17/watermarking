@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, set_seed
 import pandas as pd
 import numpy as np
 import argparse
@@ -10,39 +10,17 @@ from torch.cuda import empty_cache
 from contextlib import contextmanager
 from typing import List, Dict
 from tqdm import tqdm
-import datetime
+from datetime import datetime
 
 from compute_statistics import assign_buckets 
 from compute_statistics import analyze_token_distributions
 
-# --model "meta-llama/Llama-3.2-1B-Instruct"
+np.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+set_seed(42)
 
-parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
-parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
-parser.add_argument('--quantize', action='store_true', help='Use 8-bit quantization for the model.', default=False)
-
-args = parser.parse_args()
-
-prompts = [
-        "What is the capital of France?",
-        "How do you make a cake?",
-        "Tell me a joke.",
-        "What is the meaning of life?",
-        "Explain quantum physics in simple terms.",
-        "Tell me a creative love story between a robot and a human.",
-    ]
-    
-system_prompts = [
-        "Be creative and helpful.",
-        "Be concise and informative.",
-        "Be detailed and thorough.",
-        "Use flashy language and be engaging.",
-        "Use colorful language and be engaging.",
-    ] 
-
-temperatures = [0.5, 0.7, 1.0, 1.2, 1.4]
-
-max_output_tokens = [50, 100, 250, 400]
+# --model "meta-llama/Llama-3.2-1B-Instruct" --prompt "Tell me a creative love story between a robot and a human." --sys "Be creative and helpful."
 
 def format_chat(tokenizer, prompt: str, system_prompt: str = "", has_chat_template=False) -> str:
         """Format the conversation using the model's chat template or a default format."""
@@ -73,6 +51,42 @@ def format_chat(tokenizer, prompt: str, system_prompt: str = "", has_chat_templa
             return formatted
 
 def main():
+    prompts = [
+            "What is the capital of France?",
+            "How do you make a cake?",
+            "Tell me an elaborate joke.",
+            "What is the meaning of life?",
+            "Explain quantum physics in simple terms.",
+            "Tell me a creative love story between a robot and a human.",
+        ]
+        
+    system_prompts = [
+            "Be creative and helpful.",
+            "Be concise and informative.",
+            "Be detailed and thorough.",
+            "Use flashy language and be engaging.",
+            "Use colorful language and be engaging.",
+        ] 
+
+    # temperatures = [0.5, 0.7, 1.0, 1.2, 1.4]
+    temperatures = [1.0]
+
+    # max_output_tokens = [50, 100, 250, 400]
+    max_output_tokens = [50]
+    parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
+    parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
+    parser.add_argument('--quantize', action='store_true', help='Use 8-bit quantization for the model.', default=False)
+    parser.add_argument('--prompt', type=str, help='Prompt to analyze.', default=None)
+    parser.add_argument('--sys', type=str, help='System prompt to analyze.', default=None)
+    # --prompt "Tell me a creative love story between a robot and a human." --sys "Be creative and helpful."
+    
+    args = parser.parse_args()
+
+    if args.prompt is not None:
+        prompts = [args.prompt]
+    if args.sys is not None:
+        system_prompts = [args.sys]
+
     print("Loading model and tokenizer...")
     config = AutoConfig.from_pretrained(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -122,6 +136,7 @@ def main():
                             system_prompt,
                             has_chat_template
                         )
+
                         
                         # Tokenize the input
                         inputs = tokenizer(
@@ -130,6 +145,7 @@ def main():
                             padding=True,
                             truncation=True
                         ).to(model.device)
+                        # print(inputs)
                         
                         # Generate with specified parameters
                         with torch.no_grad():
@@ -139,16 +155,41 @@ def main():
                                 temperature=temperature,
                                 return_dict_in_generate=True,
                                 output_scores=True,
+                                output_logits=True,
                                 do_sample=True,
                                 pad_token_id=tokenizer.pad_token_id,
-                                eos_token_id=tokenizer.eos_token_id
+                                eos_token_id=tokenizer.eos_token_id,
                             )
+
+                        # Decode generated text
+                        generated_text = tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
                         
+                        input_length = inputs.input_ids.shape[1]
+                        generated_tokens = outputs.sequences[0][input_length:]
+                        
+                        # Decode each new token individually
+                        decoded_tokens = [
+                            tokenizer.decode(token.item()) 
+                            for token in generated_tokens
+                        ]
+                        # print(decoded_tokens)
+
                         # Process token distributions
                         token_distributions = []
-                        for scores in outputs.scores:
+                        # for scores in outputs.scores:
+                        for scores in outputs.logits:
                             probs = torch.softmax(scores[0], dim=-1).cpu().numpy()
                             token_distributions.append(probs)
+                        
+                        # --- Debugging: Print non-zero probabilities for each token ---
+                        # # Indicies and values where nonzero
+                        # for dist in token_distributions:
+                        #     dist = np.array(dist)  # Convert to NumPy array for processing
+                        #     print(dist[dist > 0])
+                        #     non_zero_indices = np.nonzero(dist)[0]  # Get indices of non-zero probabilities
+                        #     non_zero_tokens = tokenizer.convert_ids_to_tokens(non_zero_indices.tolist())  # Convert IDs to tokens
+                        #     print(non_zero_tokens)  # Print human-readable tokens
+
                         
                         # Analyze distributions for each token
                         token_stats = analyze_token_distributions(
@@ -157,13 +198,16 @@ def main():
                         )
                         
                         # Record results
-                        for token_stat in token_stats:
+                        for idx, (token_stat, decoded_token) in enumerate(zip(token_stats, decoded_tokens)):
                             result = {
                                 "prompt": prompt,
                                 "system_prompt": system_prompt,
                                 "temperature": temperature,
                                 "max_output_tokens": max_output_token,
+                                "generated_text": generated_text,
                                 "token_index": token_stat["token_index"],
+                                "token_text": decoded_token,
+                                "cumulative_text": "".join(decoded_tokens[:idx + 1]),
                                 "entropy": token_stat["entropy"]
                             }
                             # Add AUC values for each bucket size
@@ -187,9 +231,27 @@ def main():
 
     # Convert results to DataFrame and save
     df_results = pd.DataFrame(results)
-    output_path = f"token_distribution_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    
+    # Save detailed results
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = Path(__file__).resolve().parent / "sanity_check_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"analysis_results_{timestamp}.csv"
     df_results.to_csv(output_path, index=False)
-    print(f"Analysis complete. Results saved to {output_path}")
+    
+    # # Create a summary with aggregated statistics
+    # summary_df = df_results.groupby(['prompt', 'system_prompt', 'temperature', 'max_output_tokens']).agg({
+    #     'entropy': ['mean', 'std', 'min', 'max'],
+    #     'generated_text': 'first'
+    # }).reset_index()
+    
+    # # Save summary
+    # summary_path = f"analysis_summary_{timestamp}.csv"
+    # summary_df.to_csv(summary_path, index=False)
+    
+    # print(f"Analysis complete. Results saved to:")
+    # print(f"  Detailed results: {output_path}")
+    # print(f"  Summary: {summary_path}")
 
 if __name__ == "__main__":
-    main() 
+    main()
