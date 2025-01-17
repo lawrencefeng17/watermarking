@@ -4,37 +4,49 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-prompts = [
-        "List the prime numbers less than 100.", 
-        "What is the meaning of life?",
-        "Explain quantum physics.",
-        "Tell me a love story between a robot and a human.",
-    ]
-        
-system_prompts = [
-        "Be creative and helpful.",
-        "Be concise and informative.",
-        "Be detailed and thorough.",
-        "Use flashy language and be engaging.",
-    ] 
-
-temperatures = [0.5, 0.7, 1.0, 1.2, 1.4]
-# temperatures = [0.5, 1.0]
-
-max_output_tokens = [50, 100, 250, 400]
-
 df_results = pd.read_csv("/home/lawrence/prc/src/sanity_check_results/analysis_results_20250117_095113.csv")
+
+prompts = df_results["prompt"].unique()
+system_prompts = df_results["system_prompt"].unique()
+temperatures = df_results["temperature"].unique()
 
 output_dir = Path(__file__).resolve().parent / "sanity_check_results"
 
-# Simple token metrics plot
-for prompt in prompts:
-    for system_prompt in system_prompts:
-        for temperature in temperatures:
-            for max_output_token in max_output_tokens:
-                plot_simple_token_metrics(df_results, 
-                                            prompt=prompt, 
-                                            system_prompt=system_prompt, 
-                                            temperature=temperature, 
-                                            save_dir=output_dir, 
-                                            max_output_tokens=max_output_token)
+# # Simple token metrics plot
+# for prompt in prompts:
+#     for system_prompt in system_prompts:
+#         for temperature in temperatures:
+#                 plot_simple_token_metrics(df_results, 
+#                                             prompt=prompt, 
+#                                             system_prompt=system_prompt, 
+#                                             temperature=temperature, 
+#                                             save_dir=output_dir, 
+#                                             max_output_tokens=100)
+
+timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+# Create a summary with aggregated statistics
+summary_df = df_results.groupby(['prompt', 'system_prompt', 'temperature', 'max_output_tokens']).agg({
+    'entropy': ['mean', 'std'],
+    'auc_2': ['mean', 'std'],
+    'auc_4': ['mean', 'std'],
+    'auc_8': ['mean', 'std'],
+    'auc_16': ['mean', 'std'],
+    'auc_32': ['mean', 'std'],
+    'auc_64': ['mean', 'std'],
+    'auc_128': ['mean', 'std'],
+    'auc_256': ['mean', 'std'],
+    'auc_512': ['mean', 'std'],
+    'auc_1024': ['mean', 'std'],
+    'auc_2048': ['mean', 'std'],
+    'auc_4096': ['mean', 'std'],
+    'auc_8192': ['mean', 'std'],
+    'auc_16384': ['mean', 'std'],
+}).reset_index()
+
+# Save summary
+summary_path = output_dir / f"analysis_summary_{timestamp}.csv"
+summary_df.to_csv(summary_path, index=False)
+
+print(f"Analysis complete. Results saved to:")
+print(f"  Detailed results: {output_dir}")
+print(f"  Summary: {summary_path}")

@@ -389,6 +389,12 @@ def plot_simple_token_metrics(df: pd.DataFrame,
         ax1.set_title(f'Token-wise Entropy (tokens {start_idx}-{end_idx-1})')
         ax1.set_xticklabels([])  # Remove x labels from top plot
         ax1.set_xlabel('')
+
+        # Add average entropy line
+        avg_entropy = plot_data['entropy'].mean()
+        ax1.axhline(y=avg_entropy, color='red', linestyle='--', alpha=0.5)
+        ax1.text(len(plot_data)-1, avg_entropy, f' Avg={avg_entropy:.3f}', 
+                color='red', va='center')
         
         # Plot AUC
         sns.barplot(data=plot_data, x=range(len(plot_data)), y=f'auc_{bucket_size}', ax=ax2, color='lightgreen')
