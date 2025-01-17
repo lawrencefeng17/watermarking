@@ -1,2 +1,5 @@
 *.csv
 statistics/testing
+src/initial_statistics
+statistics_archive/
+src/sanity_check_results_old/
