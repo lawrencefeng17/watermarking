@@ -235,7 +235,7 @@ def plot_comparison_grid(df: pd.DataFrame,
         plt.tight_layout()
         
         if save_dir:
-            save_path = save_dir / f"comparison_grid_{prompt}_max-tokens={max_output_tokens}_{timestamp}.png"
+            save_path = save_dir / f"comparison_grid_{metric}_{prompt}_max-tokens={max_output_tokens}_{timestamp}.png"
             plt.savefig(save_path, bbox_inches='tight', dpi=300)
             plt.close()
         else:
@@ -328,6 +328,7 @@ def create_analysis_report(df: pd.DataFrame, output_dir: Path):
     
     for token_limit in unique_max_output_tokens:
         plot_comparison_grid(df, prompts=unique_prompts, save_dir=grid_dir, max_output_tokens=token_limit)
+        plot_comparison_grid(df, prompts=unique_prompts, save_dir=grid_dir, max_output_tokens=token_limit, metric='auc_2')
     
     # 3. Create aggregate statistics plots
     stats_dir = output_dir / 'aggregate_stats'

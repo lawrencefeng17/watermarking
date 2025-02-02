@@ -1,24 +1,30 @@
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from datasets import load_dataset
 import numpy as np
 import pandas as pd
-from pathlib import Path
-import argparse
-import json
+import torch
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, set_seed
+from datasets import load_dataset
 import gc
 from torch.cuda import empty_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from tqdm import tqdm
-from datetime import datetime
 
-###############################################################################
-#                           ARG PARSING & SETUP                               #
-###############################################################################
+import argparse
+from pathlib import Path
+import json
+from datetime import datetime
+import logging
+import sys
+
 # --dataset "databricks/databricks-dolly-15k"
 # --model "meta-llama/Llama-3.2-1B-Instruct"
 # "Qwen/Qwen2.5-1.5B-Instruct"
+
+np.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+set_seed(42)
 
 def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quantize):
     """
@@ -84,6 +90,22 @@ def assign_buckets(vocab_size, num_buckets, seed=None):
     
     return bucket_assignments
 
+def get_buckets(vocab_size, num_buckets, seed=None):
+    """
+    Precomputes bucket assignments for multiple bucket sizes.
+    """
+    bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
+    bucket_assignments_dict = {}
+    print("Precomputing bucket assignments...")
+    for num_buckets in bucket_sizes:
+        seed = num_buckets  # each bucket size gets a different seed
+        bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
+        bucket_assignments_dict[num_buckets] = bucket_assignments
+
+###############################################################################
+#                            STATISTICS FUNCTIONS                             #
+###############################################################################  
+
 def compute_auc(token_probs, bucket_assignments, num_buckets):
     """
     Computes the "AUC"-like statistic for a single token's probability distribution.
@@ -100,20 +122,6 @@ def compute_auc(token_probs, bucket_assignments, num_buckets):
     w_i = np.bincount(bucket_assignments, weights=token_probs, minlength=num_buckets)
     max_vals = np.maximum(0, 1/num_buckets - w_i)
     return np.sum(max_vals)
-
-# def compute_entropy(token_probs):
-#     """
-#     Computes entropy (base-2) for a single token's probability distribution.
-
-#     Args:
-#         token_probs (np.ndarray): Array of token probabilities (size: vocab_size).
-
-#     Returns:
-#         float: Entropy value.
-#     """
-#     # Avoid log(0) by adding a small epsilon
-#     token_probs = np.where(token_probs > 0, token_probs, 1e-12)
-#     return -np.sum(token_probs * np.log2(token_probs))
 
 from scipy.stats import entropy
 
@@ -172,20 +180,24 @@ def cuda_memory_manager():
 ###############################################################################
 def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
     """
-    Generate token distributions for a batch of prompts. 
+    Generate token distributions for a batch of prompts.
+    If OOM occurs, automatically reduces batch size and processes in smaller batches.
     Returns a list of shape [batch_size, #generated_tokens, vocab_size].
     
     Args:
-        prompts (List[str]): List of prompt strings.
+        prompts (List[str]): Batch of prompt strings.
         model: Loaded language model.
         tokenizer: Corresponding tokenizer.
         max_new_tokens (int): Maximum number of tokens to generate per prompt.
 
     Returns:
-        List[List[np.ndarray]]: Nested list containing token probability distributions.
+        Tuple[
+            List[List[np.ndarray]],  # Nested list of token probability distributions with shape [batch_size, max_new_tokens, vocab_size].
+            int                      # The updated batch size used successfully.
+        ]
     """
-    try:
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    def process_batch(batch_prompts):
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
         
         with cuda_memory_manager():
             outputs = model.generate(
@@ -202,24 +214,53 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
             # generated_texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs.sequences]
             # for text in generated_texts:
             #     print(text)
+
+            # outputs.logits is a tuple of max_new_tokens tensors, each shape=[batch_size, vocab_size]
             
-            # outputs.scores is a list of length=#generated_tokens
-            # Each element is shape=[batch_size, vocab_size]
-            # We'll transpose so we get per-sequence distributions:
-            #  batch_distributions[seq_idx] = [ (#generated_tokens, vocab_size) ]
             batch_distributions = []
-            for seq_scores in zip(*outputs.logits):
-                # seq_scores is a tuple of length=#generated_tokens, each element shape=(vocab_size,)
+            # iterate over over tokens generated for each prompt
+            for seq_scores in zip(*outputs.logits): # seq_scores is a tuple of max_new_tokens tensors of shape [batch_size]
                 distributions = []
-                for score in seq_scores:
-                    probs = torch.softmax(score, dim=-1).cpu().numpy()
-                    distributions.append(probs)
-                batch_distributions.append(distributions)
+                for score in seq_scores: # iterate over each token's score (max_new_tokens iterations)
+                    probs = torch.softmax(score, dim=-1).cpu().numpy() # softmax over vocab_size to obtain probabilities
+                    distributions.append(probs) # appending one token at a time
+                # distributions is a list of max_new_tokens tensors of shape [batch_size, vocab_size]
+                batch_distributions.append(distributions) 
             
-            return batch_distributions  # list of length=batch_size
-    except Exception as e:
-        print(f"Error in batch processing: {e}")
-        return [None] * len(prompts)
+            # batch_distributions is a list of lists 
+            # dimension [batch_size, max_new_tokens, vocab_size]
+            return batch_distributions
+
+    original_batch_size = len(prompts)
+    current_batch_size = original_batch_size
+    
+    while current_batch_size > 0:
+        try:
+            all_distributions = []
+            # Process all prompts in chunks of current_batch_size
+            for i in range(0, original_batch_size, current_batch_size):
+                batch_prompts = prompts[i:min(i + current_batch_size, original_batch_size)]
+                batch_distributions = process_batch(batch_prompts)
+                all_distributions.extend(batch_distributions)
+                torch.cuda.empty_cache()
+            
+            return all_distributions, current_batch_size
+            
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            if current_batch_size == 1:
+                logging.error("Out of memory even with batch size 1. Consider reducing max_new_tokens.")
+                sys.exit(1)
+            
+            current_batch_size = (current_batch_size + 1) // 2
+            print(f"OOM error, reducing batch size to: {current_batch_size}")
+            continue
+
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+            sys.exit(1)
 
 def analyze_token_distributions(token_distributions, bucket_assignments_dict):
     """
@@ -256,18 +297,25 @@ def analyze_token_distributions(token_distributions, bucket_assignments_dict):
     
     return token_stats  # List of dicts
 
-def analyze_worker(item, bucket_assignments_dict):
+def analyze_worker(item, vocab_size):
     """
     Worker function for parallel analysis.
 
     Args:
         item (Tuple): (idx, prompt, category, token_distributions)
-        bucket_assignments_dict (Dict[int, np.ndarray]): Precomputed bucket assignments.
-
+        vocab_size (int): Number of tokens in the vocabulary.
     Returns:
         Tuple: (idx, prompt, category, List[Dict])
     """
     idx, prompt, category, token_distributions = item
+
+    # generate a fresh set of bucket assignments for each prompt
+    bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
+    bucket_assignments_dict = {}
+    for num_buckets in bucket_sizes:
+        seed = num_buckets  # each bucket size gets a different seed
+        bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
+        bucket_assignments_dict[num_buckets] = bucket_assignments
     
     token_stats = analyze_token_distributions(token_distributions, bucket_assignments_dict)
     return idx, prompt, category, token_stats
@@ -276,6 +324,8 @@ def analyze_worker(item, bucket_assignments_dict):
 #                                  MAIN                                       #
 ###############################################################################
 def main():
+    logging.basicConfig(level=logging.ERROR)
+
     parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
     parser.add_argument('--dataset', type=str, required=True, help='Name or path of the dataset.')
     parser.add_argument('--model', type=str, required=True, help='Name or path of the model.')
@@ -283,12 +333,16 @@ def main():
     parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
     parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
     parser.add_argument('--num_workers', type=int, default=20, help='Number of parallel workers for analysis.')
+    parser.add_argument('--output_dir', type=str, help='Output directory for logs, checkpoints, and results.')
     args = parser.parse_args()
 
     # Output directory for logs, checkpoints, and results
     src_dir = Path(__file__).resolve().parent
     root_dir = src_dir.parent
-    output_dir = create_output_dir(root_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = create_output_dir(root_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_file = output_dir / "checkpoint.json"
@@ -339,16 +393,16 @@ def main():
     
     print(f"Model loaded with {'8-bit quantization' if args.quantize else 'full precision'}")
     
-    #---------------------------------------------------------------------------
-    # 3) Precompute bucket assignments for multiple bucket sizes
-    #---------------------------------------------------------------------------
-    bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
-    bucket_assignments_dict = {}
-    print("Precomputing bucket assignments...")
-    for num_buckets in bucket_sizes:
-        seed = num_buckets  # each bucket size gets a different seed
-        bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
-        bucket_assignments_dict[num_buckets] = bucket_assignments
+    # #---------------------------------------------------------------------------
+    # # 3) Precompute bucket assignments for multiple bucket sizes
+    # #---------------------------------------------------------------------------
+    # bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
+    # bucket_assignments_dict = {}
+    # print("Precomputing bucket assignments...")
+    # for num_buckets in bucket_sizes:
+    #     seed = num_buckets  # each bucket size gets a different seed
+    #     bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
+    #     bucket_assignments_dict[num_buckets] = bucket_assignments
     
     #---------------------------------------------------------------------------
     # 4) Load progress (checkpoint) and existing metadata
@@ -367,6 +421,8 @@ def main():
     # We'll store our futures in a dict so that we can gather results as soon
     # as they complete, then update metadata/checkpoints incrementally.
     future_to_idx = {}
+
+    batch_size = args.batch_size
     
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         for idx, entry in enumerate(tqdm(dataset['train'], desc="Processing Prompts")):
@@ -382,16 +438,19 @@ def main():
             batch_categories.append(category)
             
             # Process once we hit batch_size
-            if len(batch_prompts) == args.batch_size:
+            if len(batch_prompts) == batch_size:
                 # Generate token distributions for this batch
-                batch_distributions = get_batch_token_distributions(
+                batch_distributions, current_batch_size = get_batch_token_distributions(
                     batch_prompts, model, tokenizer, args.max_new_tokens
                 )
+
+                batch_size = current_batch_size # Update batch size in case of OOM
                 
                 # Submit each sequence in the batch for analysis
-                for i, dist in enumerate(batch_distributions):
+                for i, dist in enumerate(batch_distributions): 
                     item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist)
-                    fut = executor.submit(analyze_worker, item, bucket_assignments_dict)
+                    # submit one prompt at a time
+                    fut = executor.submit(analyze_worker, item, vocab_size)
                     future_to_idx[fut] = batch_indices[i]
                 
                 # As each future completes, retrieve results
@@ -437,12 +496,12 @@ def main():
         # 6) Process any leftover items in the final (incomplete) batch
         #-----------------------------------------------------------------------
         if batch_prompts:
-            batch_distributions = get_batch_token_distributions(
+            batch_distributions, _ = get_batch_token_distributions(
                 batch_prompts, model, tokenizer, args.max_new_tokens
             )
             for i, dist in enumerate(batch_distributions):
                 item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist)
-                fut = executor.submit(analyze_worker, item, bucket_assignments_dict)
+                fut = executor.submit(analyze_worker, item, vocab_size)
                 future_to_idx[fut] = batch_indices[i]
             
             # Collect final results
@@ -471,10 +530,12 @@ def main():
                     save_checkpoint(checkpoint_file, last_processed_idx)
             
             # Save updated metadata after final batch
-            save_metadata(metadata)
+            save_metadata(metadata_file, metadata)
     
     print("Completed!")
     print(f"Saved to {output_dir}")
+
+    breakpoint()
 
 if __name__ == "__main__":
     main()
