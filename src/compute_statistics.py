@@ -181,19 +181,18 @@ def cuda_memory_manager():
 def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
     """
     Generate token distributions for a batch of prompts.
-    If OOM occurs, automatically reduces batch size and processes in smaller batches.
-    Returns a list of shape [batch_size, #generated_tokens, vocab_size].
     
     Args:
-        prompts (List[str]): Batch of prompt strings.
-        model: Loaded language model.
-        tokenizer: Corresponding tokenizer.
-        max_new_tokens (int): Maximum number of tokens to generate per prompt.
-
+        prompts (List[str]): Batch of prompt strings
+        model: Loaded language model
+        tokenizer: Corresponding tokenizer
+        max_new_tokens (int): Maximum number of tokens to generate per prompt
+    
     Returns:
         Tuple[
-            List[List[np.ndarray]],  # Nested list of token probability distributions with shape [batch_size, max_new_tokens, vocab_size].
-            int                      # The updated batch size used successfully.
+            List[List[np.ndarray]],  # List[prompt_idx][token_idx] -> probability distribution
+            List[List[int]],         # List[prompt_idx][token_idx] -> token_id
+            int                      # Updated batch size
         ]
     """
     def process_batch(batch_prompts):
@@ -211,25 +210,27 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
                 eos_token_id=tokenizer.eos_token_id
             )
 
-            # generated_texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs.sequences]
-            # for text in generated_texts:
-            #     print(text)
-
-            # outputs.logits is a tuple of max_new_tokens tensors, each shape=[batch_size, vocab_size]
+            # Get generated token IDs (excluding input sequence)
+            input_length = inputs.input_ids.shape[1]
+            generated_token_ids = [
+                seq[input_length:].tolist() for seq in outputs.sequences
+            ]
             
-            batch_distributions = []
-            # iterate over over tokens generated for each prompt
-            for seq_scores in zip(*outputs.logits): # seq_scores is a tuple of max_new_tokens tensors of shape [batch_size]
-                distributions = []
-                for score in seq_scores: # iterate over each token's score (max_new_tokens iterations)
-                    probs = torch.softmax(score, dim=-1).cpu().numpy() # softmax over vocab_size to obtain probabilities
-                    distributions.append(probs) # appending one token at a time
-                # distributions is a list of max_new_tokens tensors of shape [batch_size, vocab_size]
-                batch_distributions.append(distributions) 
+            # Organize distributions by prompt then by token
+            # outputs.logits is tuple of tensors, each shape [batch_size, vocab_size]
+            all_distributions = []
             
-            # batch_distributions is a list of lists 
-            # dimension [batch_size, max_new_tokens, vocab_size]
-            return batch_distributions
+            # First, organize by prompt
+            for prompt_idx in range(len(batch_prompts)):
+                prompt_distributions = []
+                # Then by token position
+                for token_logits in outputs.logits:
+                    # Get logits for this prompt and convert to probabilities
+                    token_probs = torch.softmax(token_logits[prompt_idx], dim=-1).cpu().numpy()
+                    prompt_distributions.append(token_probs)
+                all_distributions.append(prompt_distributions)
+            
+            return all_distributions, generated_token_ids
 
     original_batch_size = len(prompts)
     current_batch_size = original_batch_size
@@ -237,19 +238,22 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
     while current_batch_size > 0:
         try:
             all_distributions = []
-            # Process all prompts in chunks of current_batch_size
+            all_token_ids = []
+            
+            # Process prompts in chunks
             for i in range(0, original_batch_size, current_batch_size):
                 batch_prompts = prompts[i:min(i + current_batch_size, original_batch_size)]
-                batch_distributions = process_batch(batch_prompts)
+                batch_distributions, batch_token_ids = process_batch(batch_prompts)
                 all_distributions.extend(batch_distributions)
+                all_token_ids.extend(batch_token_ids)
                 torch.cuda.empty_cache()
             
-            return all_distributions, current_batch_size
+            return all_distributions, all_token_ids, current_batch_size
             
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             gc.collect()
-
+            
             if current_batch_size == 1:
                 logging.error("Out of memory even with batch size 1. Consider reducing max_new_tokens.")
                 sys.exit(1)
@@ -257,7 +261,7 @@ def get_batch_token_distributions(prompts, model, tokenizer, max_new_tokens=50):
             current_batch_size = (current_batch_size + 1) // 2
             print(f"OOM error, reducing batch size to: {current_batch_size}")
             continue
-
+        
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
             sys.exit(1)
@@ -297,17 +301,21 @@ def analyze_token_distributions(token_distributions, bucket_assignments_dict):
     
     return token_stats  # List of dicts
 
-def analyze_worker(item, vocab_size):
+def analyze_worker(item, vocab_size, tokenizer):
     """
     Worker function for parallel analysis.
-
+    
     Args:
-        item (Tuple): (idx, prompt, category, token_distributions)
-        vocab_size (int): Number of tokens in the vocabulary.
+        item (Tuple): (idx, prompt, category, token_distributions, token_ids)
+            - token_distributions: List[token_idx] -> probability distribution
+            - token_ids: List[token_idx] -> token_id
+        vocab_size (int): Number of tokens in vocabulary
+        tokenizer: Tokenizer for decoding tokens
+    
     Returns:
         Tuple: (idx, prompt, category, List[Dict])
     """
-    idx, prompt, category, token_distributions = item
+    idx, prompt, category, token_distributions, token_ids = item
 
     # generate a fresh set of bucket assignments for each prompt
     bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
@@ -317,13 +325,23 @@ def analyze_worker(item, vocab_size):
         bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
         bucket_assignments_dict[num_buckets] = bucket_assignments
     
+    # use the same hash for each token in the prompt
     token_stats = analyze_token_distributions(token_distributions, bucket_assignments_dict)
+
+    for i, stat in enumerate(token_stats):
+        token_id = token_ids[i]
+        stat['token_id'] = token_id
+        stat['token_text'] = tokenizer.decode([token_id])
+        stat['is_eos'] = (token_id == tokenizer.eos_token_id)
+        
     return idx, prompt, category, token_stats
 
 ###############################################################################
 #                                  MAIN                                       #
 ###############################################################################
 def main():
+    # python compute_statistics.py --dataset "databricks/databricks-dolly-15k" --model "meta-llama/Llama-3.2-1B-Instruct" --max_new_tokens 200 --batch_size 128
+
     logging.basicConfig(level=logging.ERROR)
 
     parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
@@ -440,17 +458,17 @@ def main():
             # Process once we hit batch_size
             if len(batch_prompts) == batch_size:
                 # Generate token distributions for this batch
-                batch_distributions, current_batch_size = get_batch_token_distributions(
+                batch_distributions, batch_token_ids, current_batch_size = get_batch_token_distributions(
                     batch_prompts, model, tokenizer, args.max_new_tokens
                 )
 
                 batch_size = current_batch_size # Update batch size in case of OOM
                 
                 # Submit each sequence in the batch for analysis
-                for i, dist in enumerate(batch_distributions): 
-                    item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist)
-                    # submit one prompt at a time
-                    fut = executor.submit(analyze_worker, item, vocab_size)
+                for i in range(len(batch_distributions)):
+                    item = (batch_indices[i], batch_prompts[i], batch_categories[i], 
+                            batch_distributions[i], batch_token_ids[i])
+                    fut = executor.submit(analyze_worker, item, vocab_size, tokenizer)
                     future_to_idx[fut] = batch_indices[i]
                 
                 # As each future completes, retrieve results
@@ -471,6 +489,9 @@ def main():
                             "prompt": prompt,
                             "category": cat,
                             "token_index": token_stat.get("token_index"),
+                            "token_id": token_stat.get("token_id"),
+                            "token_text": token_stat.get("token_text"),
+                            "is_eos": token_stat.get("is_eos"),
                             "entropy": token_stat.get("entropy"),
                             **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
                         })
@@ -496,12 +517,12 @@ def main():
         # 6) Process any leftover items in the final (incomplete) batch
         #-----------------------------------------------------------------------
         if batch_prompts:
-            batch_distributions, _ = get_batch_token_distributions(
+            batch_distributions, batch_token_ids, _ = get_batch_token_distributions(
                 batch_prompts, model, tokenizer, args.max_new_tokens
             )
             for i, dist in enumerate(batch_distributions):
-                item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist)
-                fut = executor.submit(analyze_worker, item, vocab_size)
+                item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist, batch_token_ids[i])
+                fut = executor.submit(analyze_worker, item, vocab_size, tokenizer)
                 future_to_idx[fut] = batch_indices[i]
             
             # Collect final results
@@ -520,6 +541,9 @@ def main():
                         "prompt": prompt,
                         "category": cat,
                         "token_index": token_stat.get("token_index"),
+                        "token_id": token_stat.get("token_id"),
+                        "token_text": token_stat.get("token_text"),
+                        "is_eos": token_stat.get("is_eos"),
                         "entropy": token_stat.get("entropy"),
                         **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
                     })

@@ -4,5 +4,5 @@ python analyze.py \
     --dataset "databricks/databricks-dolly-15k" \
     --model "meta-llama/Llama-3.2-1B-Instruct" \
     --batch_size 256 \
-    --max_new_tokens 50 \
+    --max_new_tokens 10 \
     --num_workers 10 \

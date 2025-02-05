@@ -13,7 +13,7 @@ fi
 source "$CONFIG_FILE"
 
 # Construct the command dynamically
-CMD="python analyze.py --dataset \"$DATASET\" --model \"$MODEL\" --batch_size $BATCH_SIZE --max_new_tokens $MAX_NEW_TOKENS --num_workers $NUM_WORKERS --output_dir \"$OUTPUT_DIR\""
+CMD="python compute_statistics.py --dataset \"$DATASET\" --model \"$MODEL\" --batch_size $BATCH_SIZE --max_new_tokens $MAX_NEW_TOKENS --num_workers $NUM_WORKERS --output_dir \"$OUTPUT_DIR\""
 
 # Add --quantize flag only if it's enabled
 if [ "$QUANTIZE" = "true" ]; then
