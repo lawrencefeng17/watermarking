@@ -1,7 +1,7 @@
+# this version of compute_statistics.py is a concurrent version that uses a queue to increase GPU utilization
 import numpy as np
 import pandas as pd
 import torch
-
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, set_seed
 from datasets import load_dataset
 import gc
@@ -19,6 +19,8 @@ from pathlib import Path
 import json
 from datetime import datetime
 import logging
+from queue import Queue
+from threading import Thread
 
 # --dataset "databricks/databricks-dolly-15k"
 # --model "meta-llama/Llama-3.2-1B-Instruct"
@@ -163,7 +165,6 @@ def compute_auc_jit(token_probs, bucket_assignments, num_buckets):
         if diff > 0:
             auc += diff
     return auc
-
 
 def compute_entropy(dists):
     """
@@ -383,10 +384,56 @@ def analyze_worker(item, bucket_assignments_dict, tokenizer):
     return idx, prompt, category, token_stats
 
 ###############################################################################
-#                                  MAIN                                       #
+#                     GPU Inference Producer Function                       #
+###############################################################################
+def gpu_inference_producer(dataset, model, tokenizer, max_new_tokens, batch_size, start_idx, inference_queue):
+    """
+    Reads the dataset starting at start_idx, processes batches on the GPU,
+    and puts the resulting inference data (distributions, token_ids, etc.)
+    into a thread-safe queue.
+    """
+    batch_prompts = []
+    batch_indices = []
+    batch_categories = []
+
+    for idx, entry in enumerate(tqdm(dataset['train'], desc="GPU Inference"), start=0):
+        if idx < start_idx:
+            continue
+        prompt = entry['instruction']
+        category = entry.get('category', 'unknown')
+        batch_prompts.append(prompt)
+        batch_indices.append(idx)
+        batch_categories.append(category)
+
+        if len(batch_prompts) == batch_size:
+            # Perform GPU inference on the current batch.
+            batch_distributions, batch_token_ids, current_batch_size = get_batch_token_distributions(
+                batch_prompts, model, tokenizer, max_new_tokens
+            )
+            # You might update batch_size here if needed (in case of OOM).
+            # Put the batch results into the queue.
+            inference_queue.put((batch_indices, batch_prompts, batch_categories,
+                                 batch_distributions, batch_token_ids))
+            # Clear the current batch.
+            batch_prompts = []
+            batch_indices = []
+            batch_categories = []
+
+    # Process any leftover prompts.
+    if batch_prompts:
+        batch_distributions, batch_token_ids, _ = get_batch_token_distributions(
+            batch_prompts, model, tokenizer, max_new_tokens
+        )
+        inference_queue.put((batch_indices, batch_prompts, batch_categories,
+                             batch_distributions, batch_token_ids))
+    # Signal termination to the consumers.
+    inference_queue.put(None)
+
+###############################################################################
+#                              MAIN FUNCTION                                #
 ###############################################################################
 def main():
-    # python compute_statistics.py --dataset "databricks/databricks-dolly-15k" --model "meta-llama/Llama-3.2-1B-Instruct" --max_new_tokens 200 --batch_size 128
+    # python concurrent_compute_statistics.py --dataset "databricks/databricks-dolly-15k" --model "meta-llama/Llama-3.2-1B-Instruct" --max_new_tokens 200 --batch_size 128
 
     logging.basicConfig(level=logging.ERROR)
 
@@ -400,12 +447,10 @@ def main():
     parser.add_argument('-o', '--output_dir', type=str, help='Provide an output directory to resume from a previous run.')
     args = parser.parse_args()
 
-
-    # Output directory for logs, checkpoints, and results
+    # Set up output directory, checkpoint, and metadata as before.
     src_dir = Path(__file__).resolve().parent
     root_dir = src_dir.parent
     if args.output_dir:
-        # parse output_dir path name
         output_dir = Path(args.output_dir)
         hyperparams = parse_hyperparameters(args.output_dir)
         args.dataset = hyperparams['dataset']
@@ -416,7 +461,6 @@ def main():
         args.quantize = hyperparams['quantize']
     else:
         output_dir = create_output_dir(root_dir, args.dataset, args.model, args.max_new_tokens, args.batch_size, args.quantize)
-
     checkpoint_file = output_dir / "checkpoint.json"
     metadata_file = output_dir / "metadata.csv"
 
@@ -430,28 +474,18 @@ def main():
     print(f"Utilizing GPUs: {torch.cuda.is_available()}")
     print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
 
-    #---------------------------------------------------------------------------
     # 1) Load dataset
-    #---------------------------------------------------------------------------
     dataset = load_dataset(args.dataset)
     
-    #---------------------------------------------------------------------------
     # 2) Load model & tokenizer
-    #---------------------------------------------------------------------------
     print("Loading model and tokenizer...")
     config = AutoConfig.from_pretrained(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    # Check for warnings
-    # Padding is on left for decoder-only models (e.g. Llama)
     tokenizer.padding_side = 'left'
-
-    # Add padding token if it doesn't exist
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-
     vocab_size = config.vocab_size
-    
     if args.quantize:
         print("Loading quantized model...")
         model = AutoModelForCausalLM.from_pretrained(
@@ -467,19 +501,14 @@ def main():
     
     print(f"Model loaded with {'8-bit quantization' if args.quantize else 'full precision'}")
     
-    #---------------------------------------------------------------------------
-    # 3) Precompute bucket assignments for multiple bucket sizes, using same hash for every prompt
-    #---------------------------------------------------------------------------
-    bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
+    # 3) Precompute bucket assignments (reuse same assignments for all prompts)
+    bucket_sizes = [2**i for i in range(1, 15)]
     bucket_assignments_dict = {}
     for num_buckets in bucket_sizes:
-        seed = num_buckets  # each bucket size gets a different seed
-        bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
-        bucket_assignments_dict[num_buckets] = bucket_assignments
+        seed = num_buckets
+        bucket_assignments_dict[num_buckets] = assign_buckets(vocab_size, num_buckets, seed=seed)
     
-    #---------------------------------------------------------------------------
-    # 4) Load progress (checkpoint) and existing metadata
-    #---------------------------------------------------------------------------
+    # 4) Load progress (checkpoint) and existing metadata; compute last contiguous index.
     def compute_last_contiguous_index(processed_indices):
         last_contiguous = -1
         for idx in sorted(processed_indices):
@@ -491,123 +520,58 @@ def main():
 
     loaded_checkpoint = load_checkpoint(checkpoint_file) 
     metadata = load_existing_metadata(metadata_file)
-
     unique_processed_indices = {entry['idx'] for entry in metadata}
     last_processed_idx = compute_last_contiguous_index(unique_processed_indices)
     processed_set = set(unique_processed_indices)
 
     print(f"Resuming from index {last_processed_idx + 1}")
     print(f"Total prompts processed (metadata): {len(unique_processed_indices)}")
-
     if len(unique_processed_indices) != loaded_checkpoint:
         print("Warning: The dataset is only partially processed.")
-
-    # clean metadata
+    # Clean metadata to remove any entries after the last contiguous index.
     metadata = [entry for entry in metadata if entry['idx'] < last_processed_idx]
 
-    #---------------------------------------------------------------------------
-    # 5) Batch process the dataset
-    #---------------------------------------------------------------------------
-    batch_prompts = []
-    batch_indices = []
-    batch_categories = []
-    
-    # We'll store our futures in a dict so that we can gather results as soon
-    # as they complete, then update metadata/checkpoints incrementally.
-    future_to_idx = {}
+    # 5) Create a thread-safe queue for passing inference results.
+    inference_queue = Queue(maxsize=10)  # Adjust maxsize as appropriate.
 
+    # Start the GPU inference producer thread.
+    gpu_thread = Thread(target=gpu_inference_producer, args=(
+        dataset, model, tokenizer, args.max_new_tokens, args.batch_size,
+        last_processed_idx + 1, inference_queue
+    ))
+    gpu_thread.start()
+
+    # Set up a ThreadPoolExecutor for CPU analysis.
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        for idx, entry in enumerate(tqdm(dataset['train'], desc="Processing Prompts")):
-            if idx <= last_processed_idx:
-                continue
-
-            print(f"Processing prompt {idx} of {len(dataset['train'])}")
-
-            prompt = entry['instruction']
-            category = entry.get('category', 'unknown')
-            batch_prompts.append(prompt)
-            batch_indices.append(idx)
-            batch_categories.append(category)
-
-            if len(batch_prompts) == args.batch_size:
-                batch_distributions, batch_token_ids, current_batch_size = get_batch_token_distributions(
-                    batch_prompts, model, tokenizer, args.max_new_tokens
-                )
-                args.batch_size = current_batch_size  # Adjust in case of OOM
-
-                for i in range(len(batch_distributions)):
-                    item = (batch_indices[i], batch_prompts[i], batch_categories[i],
+        # We'll store futures for CPU analysis.
+        cpu_futures = []
+        
+        # Continuously pull inference batches from the queue.
+        while True:
+            item = inference_queue.get()
+            if item is None:
+                # No more inference results.
+                break
+            batch_indices, batch_prompts, batch_categories, batch_distributions, batch_token_ids = item
+            
+            # For each prompt in the batch, submit a CPU analysis task.
+            for i in range(len(batch_indices)):
+                cpu_item = (batch_indices[i], batch_prompts[i], batch_categories[i],
                             batch_distributions[i], batch_token_ids[i])
-                    fut = executor.submit(analyze_worker, item, bucket_assignments_dict, tokenizer)
-                    future_to_idx[fut] = batch_indices[i]
-
-                # Process completed futures
-                done_futures = []
-                for fut in as_completed(future_to_idx):
-                    idx_done = future_to_idx[fut]
-                    done_futures.append(fut)
-                    try:
-                        res_idx, prompt, cat, token_stats = fut.result()
-                    except Exception as e:
-                        print(f"Error analyzing idx={idx_done}: {e}")
-                        res_idx, prompt, cat, token_stats = idx_done, "", "unknown", []
-
-                    # Append token stats to metadata (as in your original code)
-                    for token_stat in token_stats:
-                        metadata.append({
-                            "idx": res_idx,
-                            "prompt": prompt,
-                            "category": cat,
-                            "token_index": token_stat.get("token_index"),
-                            "token_id": token_stat.get("token_id"),
-                            "token_text": token_stat.get("token_text"),
-                            "is_eos": token_stat.get("is_eos"),
-                            "entropy": token_stat.get("entropy"),
-                            **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
-                        })
-
-                    # Mark this index as processed.
-                    processed_set.add(res_idx)
-
-                    # Update the checkpoint: only advance if the next contiguous index is in processed_set.
-                    while (last_processed_idx + 1) in processed_set:
-                        last_processed_idx += 1
-
-                    print(f"Processed {last_processed_idx} prompts")
-
-                    # Save the checkpoint after processing each future.
-                    save_checkpoint(checkpoint_file, last_processed_idx)
-
-                # Remove completed futures from our dict
-                for fut in done_futures:
-                    del future_to_idx[fut]
-
-                # Save metadata after each batch.
-                save_metadata(metadata_file, metadata)
-
-                # Clear the batch.
-                batch_prompts = []
-                batch_indices = []
-                batch_categories = []
-
-        # Process any leftover items in the final batch using the same logic.
-        if batch_prompts:
-            batch_distributions, batch_token_ids, _ = get_batch_token_distributions(
-                batch_prompts, model, tokenizer, args.max_new_tokens
-            )
-            for i, dist in enumerate(batch_distributions):
-                item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist, batch_token_ids[i])
-                fut = executor.submit(analyze_worker, item, bucket_assignments_dict, tokenizer)
-                future_to_idx[fut] = batch_indices[i]
-
-            for fut in as_completed(future_to_idx):
-                idx_done = future_to_idx[fut]
+                fut = executor.submit(analyze_worker, cpu_item, bucket_assignments_dict, tokenizer)
+                cpu_futures.append(fut)
+            
+            # Optionally, you can process completed CPU analysis tasks here to update
+            # metadata and the checkpoint incrementally rather than waiting until all futures complete.
+            # For simplicity, we show a basic example below.
+            done_futures = []
+            for fut in as_completed(cpu_futures, timeout=5):
                 try:
                     res_idx, prompt, cat, token_stats = fut.result()
                 except Exception as e:
-                    print(f"Error analyzing idx={idx_done}: {e}")
-                    res_idx, prompt, cat, token_stats = idx_done, "", "unknown", []
-
+                    print(f"Error analyzing prompt: {e}")
+                    continue
+                # Update metadata.
                 for token_stat in token_stats:
                     metadata.append({
                         "idx": res_idx,
@@ -620,16 +584,46 @@ def main():
                         "entropy": token_stat.get("entropy"),
                         **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
                     })
-
                 processed_set.add(res_idx)
                 while (last_processed_idx + 1) in processed_set:
                     last_processed_idx += 1
                 save_checkpoint(checkpoint_file, last_processed_idx)
+                done_futures.append(fut)
+            # Remove done futures from the list.
+            cpu_futures = [f for f in cpu_futures if f not in done_futures]
+            
+            # Save metadata after processing each batch.
+            save_metadata(metadata_file, metadata)
 
-            save_metadata(metadata_file, metadata)    
+        # After the producer signals termination, wait for any remaining CPU analysis tasks.
+        for fut in as_completed(cpu_futures):
+            try:
+                res_idx, prompt, cat, token_stats = fut.result()
+            except Exception as e:
+                print(f"Error analyzing prompt: {e}")
+                continue
+            for token_stat in token_stats:
+                metadata.append({
+                    "idx": res_idx,
+                    "prompt": prompt,
+                    "category": cat,
+                    "token_index": token_stat.get("token_index"),
+                    "token_id": token_stat.get("token_id"),
+                    "token_text": token_stat.get("token_text"),
+                    "is_eos": token_stat.get("is_eos"),
+                    "entropy": token_stat.get("entropy"),
+                    **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
+                })
+            processed_set.add(res_idx)
+            while (last_processed_idx + 1) in processed_set:
+                last_processed_idx += 1
+            save_checkpoint(checkpoint_file, last_processed_idx)
+        # Save final metadata.
+        save_metadata(metadata_file, metadata)
+    
+    gpu_thread.join()
     print("Completed!")
     print(f"Saved to {output_dir}")
-
     breakpoint()
 
 if __name__ == "__main__":
