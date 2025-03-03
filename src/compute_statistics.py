@@ -6,11 +6,15 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, set_se
 from datasets import load_dataset
 import gc
 from torch.cuda import empty_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
+from multiprocessing import Queue, Process, Value
+from threading import Thread
+from queue import Empty
 from contextlib import contextmanager
 from tqdm import tqdm
 
 import os
+import time
 import sys
 import re
 import numba
@@ -30,8 +34,169 @@ torch.cuda.manual_seed_all(42)
 set_seed(42)
 
 ###############################################################################
-#                        OUTPUT DIRECTORY UTILS                                #
+#                       MULTIPROCESSING UTILS                                 #
 ###############################################################################
+
+def gpu_producer(dataset, model, tokenizer, args, input_queue, output_queue, stop_event, last_processed_idx, missing_indices, pbar, active_workers):
+    """Process batches on GPU and feed to CPU workers"""
+    try:
+        if missing_indices:
+            current_missing_idx = 0
+            while current_missing_idx < len(missing_indices) and not stop_event.is_set():
+                batch_prompts = []
+                batch_indices = []
+                batch_categories = []
+                
+                while (len(batch_prompts) < args.batch_size and current_missing_idx < len(missing_indices)):
+                    idx = missing_indices[current_missing_idx]
+                    entry = dataset['train'][idx]
+                    prompt = entry['instruction']
+                    category = entry.get('category', 'unknown')
+                    
+                    batch_prompts.append(prompt)
+                    batch_indices.append(idx)
+                    batch_categories.append(category)
+                    current_missing_idx += 1
+
+                if batch_prompts:
+                    # Process batch on GPU
+                    batch_distributions, batch_token_ids, current_batch_size = get_batch_token_distributions(
+                        batch_prompts, model, tokenizer, args.max_new_tokens
+                    )
+                    
+                    # Queue work to CPU workers
+                    for i in range(len(batch_distributions)):
+                        while input_queue.qsize() >= args.batch_size * 2 and not stop_event.is_set():
+                            time.sleep(0.1)
+                        
+                        if stop_event.is_set():
+                            break
+                            
+                        item = (batch_indices[i], batch_prompts[i], batch_categories[i],
+                               batch_distributions[i], batch_token_ids[i])
+                        input_queue.put(item)
+                        
+                    pbar.set_description(f"Recovery - Active CPU Workers: {active_workers.value}, GPU→CPU: {input_queue.qsize()}, CPU→Disk: {output_queue.qsize()}")
+            
+        current_idx = last_processed_idx + 1
+        while current_idx < len(dataset['train']) and not stop_event.is_set():
+            # Prepare next batch
+            batch_prompts = []
+            batch_indices = []
+            batch_categories = []
+            
+            # Fill batch
+            while len(batch_prompts) < args.batch_size and current_idx < len(dataset['train']):
+                entry = dataset['train'][current_idx]
+                prompt = entry['instruction']
+                category = entry.get('category', 'unknown')
+                batch_prompts.append(prompt)
+                batch_indices.append(current_idx)
+                batch_categories.append(category)
+                current_idx += 1
+
+            if batch_prompts:
+                # Process batch on GPU
+                batch_distributions, batch_token_ids, current_batch_size = get_batch_token_distributions(
+                    batch_prompts, model, tokenizer, args.max_new_tokens
+                )
+                
+                # Distribute work to CPU workers
+                for i in range(len(batch_distributions)):
+                    while input_queue.qsize() >= args.batch_size * 2 and not stop_event.is_set():
+                        # If input queue is full, wait a bit
+                        time.sleep(0.1)
+                    
+                    if stop_event.is_set():
+                        break
+                        
+                    item = (batch_indices[i], batch_prompts[i], batch_categories[i],
+                           batch_distributions[i], batch_token_ids[i])
+                    input_queue.put(item)
+                    
+                # Update progress description with queue sizes and active workers
+                pbar.set_description(f"Active CPU Workers: {active_workers.value}, GPU→CPU: {input_queue.qsize()}, CPU→Disk: {output_queue.qsize()}")
+
+    finally:
+        # Signal completion to workers
+        for _ in range(args.num_workers):
+            input_queue.put(None)
+
+def progress_monitor(input_queue, output_queue, active_workers, pbar, stop_event):
+    """Monitor and update progress bar description"""
+    while not stop_event.is_set():
+        try:
+            pbar.set_description(f"Active CPU Workers: {active_workers.value}, GPU→CPU: {input_queue.qsize()}, CPU→Disk: {output_queue.qsize()}")
+            time.sleep(1)  # Update every 100ms
+        except Exception as e:
+            print(f"Error updating progress bar: {e}")
+            continue
+
+def cpu_worker(worker_id, input_queue, output_queue, bucket_assignments_dict, tokenizer, active_workers):
+    """Process CPU-intensive analysis work"""
+    while True:
+        try:
+            item = input_queue.get()  # Remove timeout
+            if item is None:  # Poison pill
+                break
+
+            with active_workers.get_lock():
+                active_workers.value += 1
+
+            idx, prompt, category, distributions, token_ids = item
+            try:
+                result = analyze_worker(
+                    (idx, prompt, category, distributions, token_ids),
+                    bucket_assignments_dict,
+                    tokenizer
+                )
+                output_queue.put((idx, result))
+            except Exception as e:
+                print(f"Worker {worker_id} error processing idx={idx}: {e}")
+                output_queue.put((idx, (idx, "", "unknown", [])))
+            finally:
+                with active_workers.get_lock():
+                    active_workers.value -= 1
+
+        except Empty:
+            continue
+
+def result_writer(output_queue, metadata, metadata_file, checkpoint_file, processed_set, 
+                 stop_event, pbar):
+    """Write results to disk as they complete"""
+    while not (stop_event.is_set() and output_queue.empty()):
+        try:
+            idx, result = output_queue.get(timeout=1)
+            prompt, cat, token_stats = result
+            
+            for token_stat in token_stats:
+                metadata.append({
+                    "idx": idx,
+                    "prompt": prompt,
+                    "category": cat,
+                    "token_index": token_stat.get("token_index"),
+                    "token_id": token_stat.get("token_id"),
+                    "token_text": token_stat.get("token_text"),
+                    "is_eos": token_stat.get("is_eos"),
+                    "entropy": token_stat.get("entropy"),
+                    **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
+                })
+            
+            processed_set.add(idx)
+            pbar.update(1)
+            
+            if len(processed_set) % 100 == 0:
+                save_metadata(metadata_file, metadata)
+                save_checkpoint(checkpoint_file, max(processed_set))
+                print(f"Saved metadata and checkpoint for {max(processed_set)} entries")
+                
+        except Empty:
+            continue
+
+################################################################################
+#                        OUTPUT DIRECTORY UTILS                                #
+################################################################################
+
 def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quantize):
     """
     Create a structured output directory for storing experiment results.
@@ -65,22 +230,46 @@ def create_output_dir(base_dir, dataset, model, max_new_tokens, batch_size, quan
     return output_dir
 
 def parse_hyperparameters(path):
-    pattern = (r".*/(?P<dataset>[^/]+)/(?P<model>[^/]+)/"
-               r"max_tokens_(?P<max_new_tokens>\d+)_"
-               r"batch_(?P<batch_size>\d+)_"
-               r"quantize_(?P<quantize>True|False)_\d+")
+    """
+    Parse hyperparameters from a statistics output directory path.
+    """
+    # Convert path to string if it's a Path object
+    path = str(path)
     
-    match = re.match(pattern, path)
-    if match:
-        parsed_data = match.groupdict()
-        parsed_data["dataset"] = parsed_data["dataset"].replace("_", "/")
-        parsed_data["model"] = parsed_data["model"].replace("_", "/")
-        parsed_data["max_new_tokens"] = int(parsed_data["max_new_tokens"])
-        parsed_data["batch_size"] = int(parsed_data["batch_size"])
-        parsed_data["quantize"] = parsed_data["quantize"] == "True"
-        return parsed_data
-    else:
-        raise ValueError("Path format is incorrect")
+    # Split path into components
+    parts = path.split('/')
+    
+    # Find the relevant parts (after 'statistics')
+    try:
+        stats_idx = parts.index('statistics')
+        dataset_part = parts[stats_idx + 1]
+        model_part = parts[stats_idx + 2]
+        config_part = parts[stats_idx + 3]
+    except (ValueError, IndexError):
+        raise ValueError("Path must contain 'statistics' directory and required components")
+
+    # Parse configuration string
+    config_pattern = r"max_tokens_(\d+)_batch_(\d+)_quantize_(True|False)_\d+T\d+"
+    config_match = re.match(config_pattern, config_part)
+    if not config_match:
+        raise ValueError("Invalid configuration format in path")
+    
+    # Extract values
+    max_new_tokens = int(config_match.group(1))
+    batch_size = int(config_match.group(2))
+    quantize = config_match.group(3) == "True"
+    
+    # Convert component names back to original format
+    dataset = dataset_part.replace('_', '/', 1)  # Only replace first underscore
+    model = model_part.replace('_', '/', 1)      # Only replace first underscore
+    
+    return {
+        "dataset": dataset,
+        "model": model,
+        "max_new_tokens": max_new_tokens,
+        "batch_size": batch_size,
+        "quantize": quantize
+    }
 
 ###############################################################################
 #                        BUCKET ASSIGNMENT UTILS                              #
@@ -163,7 +352,6 @@ def compute_auc_jit(token_probs, bucket_assignments, num_buckets):
         if diff > 0:
             auc += diff
     return auc
-
 
 def compute_entropy(dists):
     """
@@ -368,7 +556,7 @@ def analyze_worker(item, bucket_assignments_dict, tokenizer):
         tokenizer: Tokenizer for decoding tokens
     
     Returns:
-        Tuple: (idx, prompt, category, List[Dict])
+        Tuple: (prompt, category, List[Dict])
     """
     idx, prompt, category, token_distributions, token_ids = item
 
@@ -380,7 +568,7 @@ def analyze_worker(item, bucket_assignments_dict, tokenizer):
         stat['token_text'] = tokenizer.decode([token_id])
         stat['is_eos'] = (token_id == tokenizer.eos_token_id)
         
-    return idx, prompt, category, token_stats
+    return prompt, category, token_stats
 
 ###############################################################################
 #                                  MAIN                                       #
@@ -393,15 +581,14 @@ def main():
     parser = argparse.ArgumentParser(description="Eagerly analyze token distributions.")
     parser.add_argument('--dataset', type=str, help='Name or path of the dataset.')
     parser.add_argument('--model', type=str, help='Name or path of the model.')
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size for processing prompts.')
-    parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of tokens to generate per prompt.')
+    parser.add_argument('--batch_size', type=int, help='Batch size for processing prompts.')
+    parser.add_argument('--max_new_tokens', type=int, help='Maximum number of tokens to generate per prompt.')
     parser.add_argument('--quantize', action='store_true', help='Enable 8-bit quantization for the model.')
     parser.add_argument('--num_workers', type=int, default=80, help='Number of parallel workers for analysis.')
     parser.add_argument('-o', '--output_dir', type=str, help='Provide an output directory to resume from a previous run.')
     args = parser.parse_args()
 
-
-    # Output directory for logs, checkpoints, and results
+    # Output dirctory for logs, checkpoints, and results
     src_dir = Path(__file__).resolve().parent
     root_dir = src_dir.parent
     if args.output_dir:
@@ -426,9 +613,10 @@ def main():
     print(f"Max New Tokens: {args.max_new_tokens}")
     print(f"Quantization: {'Enabled' if args.quantize else 'Disabled'}")
     print(f"Parallel Workers: {args.num_workers}")
-    print(f"Output Directory: {output_dir}")
+    print(f"Output Directory: \n {output_dir}")
     print(f"Utilizing GPUs: {torch.cuda.is_available()}")
     print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    print("-"*100)
 
     #---------------------------------------------------------------------------
     # 1) Load dataset
@@ -436,7 +624,42 @@ def main():
     dataset = load_dataset(args.dataset)
     
     #---------------------------------------------------------------------------
-    # 2) Load model & tokenizer
+    # 2) Load progress (checkpoint) and existing metadata
+    #---------------------------------------------------------------------------
+    print("Loading progress (checkpoint) and existing metadata...")
+    def compute_last_contiguous_index(processed_indices):
+        last_contiguous = -1
+        for idx in sorted(processed_indices):
+            if idx == last_contiguous + 1:
+                last_contiguous = idx
+            else:
+                break
+        return last_contiguous
+
+    # loaded_checkpoint = load_checkpoint(checkpoint_file) 
+    metadata = load_existing_metadata(metadata_file)
+
+    unique_processed_indices = {entry['idx'] for entry in metadata}
+    # last_contiguous_index = compute_last_contiguous_index(unique_processed_indices)
+    processed_set = set(unique_processed_indices)
+    last_processed_idx = max(unique_processed_indices)
+
+    # print(f"Last contiguous index: {last_contiguous_index}")
+    print(f"Last processed index: {last_processed_idx}")
+    print(f"Total prompts processed (metadata): {len(unique_processed_indices)}")
+
+    missing_indices = set(range(last_processed_idx + 1)) - unique_processed_indices
+    missing_indices = sorted(list(missing_indices))
+    if len(missing_indices) > 0:
+        print("Warning: checkpoint is out of sync with metadata (missing indices)")
+        print(f"Missing indicies: {missing_indices}")
+        print(f"Let's first process the missing indices...")
+    else:
+        print("\n\n****Checkpoint is in sync with metadata****")
+    print("-"*100)
+    
+    #---------------------------------------------------------------------------
+    # 3) Load model & tokenizer
     #---------------------------------------------------------------------------
     print("Loading model and tokenizer...")
     config = AutoConfig.from_pretrained(args.model)
@@ -448,7 +671,6 @@ def main():
     # Add padding token if it doesn't exist
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
 
     vocab_size = config.vocab_size
     
@@ -468,7 +690,7 @@ def main():
     print(f"Model loaded with {'8-bit quantization' if args.quantize else 'full precision'}")
     
     #---------------------------------------------------------------------------
-    # 3) Precompute bucket assignments for multiple bucket sizes, using same hash for every prompt
+    # 4) Precompute bucket assignments for multiple bucket sizes, using same hash for every prompt
     #---------------------------------------------------------------------------
     bucket_sizes = [2**i for i in range(1, 15)]  # 2^1 to 2^14
     bucket_assignments_dict = {}
@@ -476,157 +698,62 @@ def main():
         seed = num_buckets  # each bucket size gets a different seed
         bucket_assignments = assign_buckets(vocab_size, num_buckets, seed=seed)
         bucket_assignments_dict[num_buckets] = bucket_assignments
-    
-    #---------------------------------------------------------------------------
-    # 4) Load progress (checkpoint) and existing metadata
-    #---------------------------------------------------------------------------
-    def compute_last_contiguous_index(processed_indices):
-        last_contiguous = -1
-        for idx in sorted(processed_indices):
-            if idx == last_contiguous + 1:
-                last_contiguous = idx
-            else:
-                break
-        return last_contiguous
-
-    loaded_checkpoint = load_checkpoint(checkpoint_file) 
-    metadata = load_existing_metadata(metadata_file)
-
-    unique_processed_indices = {entry['idx'] for entry in metadata}
-    last_processed_idx = compute_last_contiguous_index(unique_processed_indices)
-    processed_set = set(unique_processed_indices)
-
-    print(f"Resuming from index {last_processed_idx + 1}")
-    print(f"Total prompts processed (metadata): {len(unique_processed_indices)}")
-
-    if len(unique_processed_indices) != loaded_checkpoint:
-        print("Warning: The dataset is only partially processed.")
-
-    # clean metadata
-    metadata = [entry for entry in metadata if entry['idx'] < last_processed_idx]
 
     #---------------------------------------------------------------------------
     # 5) Batch process the dataset
     #---------------------------------------------------------------------------
-    batch_prompts = []
-    batch_indices = []
-    batch_categories = []
-    
-    # We'll store our futures in a dict so that we can gather results as soon
-    # as they complete, then update metadata/checkpoints incrementally.
-    future_to_idx = {}
+    # Initialize progress bar
+    total_missing = len(missing_indices)
+    total_new = len(dataset['train']) - (last_processed_idx + 1)
+    total_remaining = total_missing + total_new
+    print(f"Total remaining: {total_remaining}")
+    pbar = tqdm(total=total_remaining, initial=0, desc="Processing", unit="samples")
 
-    with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        for idx, entry in enumerate(tqdm(dataset['train'], desc="Processing Prompts")):
-            if idx <= last_processed_idx:
-                continue
+    input_queue = Queue(maxsize=args.batch_size * 3)  
+    output_queue = Queue()
+    stop_event = mp.Event()
 
-            print(f"Processing prompt {idx} of {len(dataset['train'])}")
+    # Initialize shared counter for active workers
+    active_workers = Value('i', 0)
 
-            prompt = entry['instruction']
-            category = entry.get('category', 'unknown')
-            batch_prompts.append(prompt)
-            batch_indices.append(idx)
-            batch_categories.append(category)
+    workers = []
+    for i in range(args.num_workers):
+        p = Process(target=cpu_worker, 
+                   args=(i, input_queue, output_queue, bucket_assignments_dict, tokenizer, active_workers))
+        p.start()
+        workers.append(p)
 
-            if len(batch_prompts) == args.batch_size:
-                batch_distributions, batch_token_ids, current_batch_size = get_batch_token_distributions(
-                    batch_prompts, model, tokenizer, args.max_new_tokens
-                )
-                args.batch_size = current_batch_size  # Adjust in case of OOM
+    # Start progress monitor thread
+    monitor = Thread(target=progress_monitor,
+                    args=(input_queue, output_queue, active_workers, pbar, stop_event))
+    monitor.daemon = True  # Thread will be killed when main process exits
+    monitor.start()
 
-                for i in range(len(batch_distributions)):
-                    item = (batch_indices[i], batch_prompts[i], batch_categories[i],
-                            batch_distributions[i], batch_token_ids[i])
-                    fut = executor.submit(analyze_worker, item, bucket_assignments_dict, tokenizer)
-                    future_to_idx[fut] = batch_indices[i]
+    writer = Thread(target=result_writer,
+               args=(output_queue, metadata, metadata_file, checkpoint_file, 
+                     processed_set, stop_event, pbar))
+    writer.start()
 
-                # Process completed futures
-                done_futures = []
-                for fut in as_completed(future_to_idx):
-                    idx_done = future_to_idx[fut]
-                    done_futures.append(fut)
-                    try:
-                        res_idx, prompt, cat, token_stats = fut.result()
-                    except Exception as e:
-                        print(f"Error analyzing idx={idx_done}: {e}")
-                        res_idx, prompt, cat, token_stats = idx_done, "", "unknown", []
+    try:
+        gpu_producer(dataset, model, tokenizer, args, input_queue, output_queue, 
+                    stop_event, last_processed_idx, missing_indices, pbar, active_workers)
+        
+        for w in workers:
+            w.join()
+        
+        stop_event.set()
+        writer.join()
+        monitor.join()  # Wait for monitor thread to finish
 
-                    # Append token stats to metadata (as in your original code)
-                    for token_stat in token_stats:
-                        metadata.append({
-                            "idx": res_idx,
-                            "prompt": prompt,
-                            "category": cat,
-                            "token_index": token_stat.get("token_index"),
-                            "token_id": token_stat.get("token_id"),
-                            "token_text": token_stat.get("token_text"),
-                            "is_eos": token_stat.get("is_eos"),
-                            "entropy": token_stat.get("entropy"),
-                            **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
-                        })
+    except KeyboardInterrupt:
+        print("\nShutting down gracefully...")
+        stop_event.set()
+        for w in workers:
+            w.terminate()
+        writer.join()
+        monitor.join()  # Wait for monitor thread to finish
 
-                    # Mark this index as processed.
-                    processed_set.add(res_idx)
-
-                    # Update the checkpoint: only advance if the next contiguous index is in processed_set.
-                    while (last_processed_idx + 1) in processed_set:
-                        last_processed_idx += 1
-
-                    print(f"Processed {last_processed_idx} prompts")
-
-                    # Save the checkpoint after processing each future.
-                    save_checkpoint(checkpoint_file, last_processed_idx)
-
-                # Remove completed futures from our dict
-                for fut in done_futures:
-                    del future_to_idx[fut]
-
-                # Save metadata after each batch.
-                save_metadata(metadata_file, metadata)
-
-                # Clear the batch.
-                batch_prompts = []
-                batch_indices = []
-                batch_categories = []
-
-        # Process any leftover items in the final batch using the same logic.
-        if batch_prompts:
-            batch_distributions, batch_token_ids, _ = get_batch_token_distributions(
-                batch_prompts, model, tokenizer, args.max_new_tokens
-            )
-            for i, dist in enumerate(batch_distributions):
-                item = (batch_indices[i], batch_prompts[i], batch_categories[i], dist, batch_token_ids[i])
-                fut = executor.submit(analyze_worker, item, bucket_assignments_dict, tokenizer)
-                future_to_idx[fut] = batch_indices[i]
-
-            for fut in as_completed(future_to_idx):
-                idx_done = future_to_idx[fut]
-                try:
-                    res_idx, prompt, cat, token_stats = fut.result()
-                except Exception as e:
-                    print(f"Error analyzing idx={idx_done}: {e}")
-                    res_idx, prompt, cat, token_stats = idx_done, "", "unknown", []
-
-                for token_stat in token_stats:
-                    metadata.append({
-                        "idx": res_idx,
-                        "prompt": prompt,
-                        "category": cat,
-                        "token_index": token_stat.get("token_index"),
-                        "token_id": token_stat.get("token_id"),
-                        "token_text": token_stat.get("token_text"),
-                        "is_eos": token_stat.get("is_eos"),
-                        "entropy": token_stat.get("entropy"),
-                        **{k: v for k, v in token_stat.items() if k.startswith("auc_")}
-                    })
-
-                processed_set.add(res_idx)
-                while (last_processed_idx + 1) in processed_set:
-                    last_processed_idx += 1
-                save_checkpoint(checkpoint_file, last_processed_idx)
-
-            save_metadata(metadata_file, metadata)    
+    pbar.close()
     print("Completed!")
     print(f"Saved to {output_dir}")
 

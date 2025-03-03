@@ -119,3 +119,14 @@ print()
 print("Maximum absolute difference:")
 print(f"  Original vs. JIT:       {max_error_jit:e}")
 print(f"  Original vs. Vectorized:{max_error_vect:e}")
+
+"""
+AUC Computation Timings:
+  Original version:    1.097 seconds
+  JIT-compiled version:0.646 seconds
+  Vectorized version:  16.391 seconds
+
+Maximum absolute difference:
+  Original vs. JIT:       3.080869e-15
+  Original vs. Vectorized:0.000000e+00
+"""
